@@ -214,3 +214,7 @@ class CPTA_iTransformer(nn.Module):
             return dec_out[:, -self.pred_len:, :], attns
         else:
             return dec_out[:, -self.pred_len:, :]  # [B, pred_len, C]
+
+
+class Model(CPTA_iTransformer):
+    pass
