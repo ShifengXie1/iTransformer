@@ -3,6 +3,7 @@ export CUDA_VISIBLE_DEVICES=1
 model_name=iTransformer_fft
 base_patch_len=48
 period_query_num=4
+Seq_len=336
 
 python -u run.py \
   --is_training 1 \
@@ -12,7 +13,7 @@ python -u run.py \
   --model $model_name \
   --data ETTh1 \
   --features M \
-  --seq_len 96 \
+  --seq_len $Seq_len \
   --pred_len 96 \
   --e_layers 2 \
   --enc_in 7 \
@@ -33,7 +34,7 @@ python -u run.py \
   --model $model_name \
   --data ETTh1 \
   --features M \
-  --seq_len 96 \
+  --seq_len $Seq_len \
   --pred_len 192 \
   --e_layers 2 \
   --enc_in 7 \
@@ -54,7 +55,7 @@ python -u run.py \
   --model $model_name \
   --data ETTh1 \
   --features M \
-  --seq_len 96 \
+  --seq_len $Seq_len \
   --pred_len 336 \
   --e_layers 2 \
   --enc_in 7 \
@@ -75,7 +76,7 @@ python -u run.py \
   --model $model_name \
   --data ETTh1 \
   --features M \
-  --seq_len 96 \
+  --seq_len $Seq_len \
   --pred_len 720 \
   --e_layers 2 \
   --enc_in 7 \

@@ -10,7 +10,9 @@ class ChannelWisePeriodTokenizer(nn.Module):
         self.seq_len = seq_len
         self.base_patch_len = max(1, int(base_patch_len))
         self.patch_projection = nn.Linear(self.base_patch_len, d_model)
+        self.patch_position_embedding = nn.Parameter(torch.zeros(1, seq_len, d_model))
         self.dropout = nn.Dropout(p=dropout)
+        nn.init.normal_(self.patch_position_embedding, std=0.02)
 
     def _detect_periods_by_fft(self, x):
         # x: [B, L, C]
@@ -59,6 +61,7 @@ class ChannelWisePeriodTokenizer(nn.Module):
 
             # [B, N_c, base_patch_len] -> [B, N_c, d_model]
             tokens = self.patch_projection(patches)
+            tokens = tokens + self.patch_position_embedding[:, :num_patches, :]
             channel_tokens.append(self.dropout(tokens))
 
         return channel_tokens, periods
