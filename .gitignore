@@ -132,3 +132,6 @@ dmypy.json
 figures/
 *README.md
 LICENSE
+results/
+test_results/
+results_*.txt
