@@ -134,4 +134,4 @@ figures/
 LICENSE
 results/
 test_results/
-results_*.txt
+result_*.txt
