@@ -4,17 +4,12 @@ import torch.nn.functional as F
 from layers.Transformer_EncDec import Encoder, EncoderLayer
 from layers.SelfAttention_Family import FullAttention, AttentionLayer
 
-class PeriodKeyPaddingMask:
-    def __init__(self, valid_mask, query_len):
-        # valid_mask: [B, S], True means the patch token has real values.
-        self.mask = (~valid_mask).unsqueeze(1).unsqueeze(2).expand(-1, 1, query_len, -1)
-
 class ChannelWisePeriodTokenizer(nn.Module):
     def __init__(self, seq_len, d_model, base_patch_len=16, dropout=0.1):
         super(ChannelWisePeriodTokenizer, self).__init__()
         self.seq_len = seq_len
         self.base_patch_len = max(1, int(base_patch_len))
-        self.patch_projection = nn.Linear(self.base_patch_len * 2, d_model)
+        self.patch_projection = nn.Linear(self.base_patch_len, d_model)
         self.patch_position_embedding = nn.Parameter(torch.zeros(1, seq_len, d_model))
         self.dropout = nn.Dropout(p=dropout)
         nn.init.normal_(self.patch_position_embedding, std=0.02)
@@ -48,56 +43,29 @@ class ChannelWisePeriodTokenizer(nn.Module):
         patches = F.interpolate(patches, size=self.base_patch_len, mode='linear', align_corners=False)
         return patches.reshape(batch_size, num_patches, self.base_patch_len)
 
-    def _resample_mask(self, patch_masks):
-        # patch_masks: [B, N_c, P_c], 1.0 means real value and 0.0 means padding.
-        patch_len = patch_masks.shape[-1]
-        if patch_len == self.base_patch_len:
-            return patch_masks
-
-        batch_size, num_patches, _ = patch_masks.shape
-        patch_masks = patch_masks.reshape(batch_size * num_patches, 1, patch_len)
-        patch_masks = F.interpolate(patch_masks, size=self.base_patch_len, mode='nearest')
-        return patch_masks.reshape(batch_size, num_patches, self.base_patch_len)
-
     def forward(self, x):
         # x: [B, L, C]
         batch_size, seq_len, num_channels = x.shape
         periods = self._detect_periods_by_fft(x)
         channel_tokens = []
-        channel_token_masks = []
 
         for channel_idx in range(num_channels):
             period = periods[channel_idx]
-            num_patches = max(1, (seq_len + period - 1) // period)
-            padded_len = num_patches * period
-            pad_len = padded_len - seq_len
+            num_patches = max(1, seq_len // period)
+            usable_len = num_patches * period
 
-            # Left padding keeps the latest observations in the final patch.
-            # x_c: [B, L] -> padded_x_c: [B, N_c * P_c]
-            x_c = x[:, :, channel_idx]
-            value_mask = torch.ones(batch_size, seq_len, device=x.device, dtype=x.dtype)
-            if pad_len > 0:
-                x_c = F.pad(x_c, (pad_len, 0), mode='constant', value=0.0)
-                value_mask = F.pad(value_mask, (pad_len, 0), mode='constant', value=0.0)
-
-            # [B, N_c * P_c] -> [B, N_c, P_c]
+            # Drop the final incomplete patch directly.
+            # x_c: [B, usable_len] -> patches: [B, N_c, P_c]
+            x_c = x[:, :usable_len, channel_idx]
             patches = x_c.reshape(batch_size, num_patches, period)
-            patch_masks = value_mask.reshape(batch_size, num_patches, period)
-            patch_token_mask = patch_masks.sum(dim=-1) > 0
-
             patches = self._resample_patch(patches)  # [B, N_c, base_patch_len]
-            patch_masks = self._resample_mask(patch_masks)  # [B, N_c, base_patch_len]
 
-            # Concatenate the padding mask so projection can distinguish real values from padding.
-            # [B, N_c, 2 * base_patch_len] -> [B, N_c, d_model]
-            patch_inputs = torch.cat([patches, patch_masks], dim=-1)
-            tokens = self.patch_projection(patch_inputs)
+            # [B, N_c, base_patch_len] -> [B, N_c, d_model]
+            tokens = self.patch_projection(patches)
             tokens = tokens + self.patch_position_embedding[:, :num_patches, :]
             channel_tokens.append(self.dropout(tokens))
-            channel_token_masks.append(patch_token_mask)
 
-        return channel_tokens, channel_token_masks, periods
-
+        return channel_tokens, periods
 
 class FixedQueryPeriodAggregation(nn.Module):
     def __init__(self, d_model, n_heads, query_num, factor=1, dropout=0.1, output_attention=False):
@@ -105,19 +73,18 @@ class FixedQueryPeriodAggregation(nn.Module):
         self.query_num = query_num
         self.queries = nn.Parameter(torch.empty(query_num, d_model))
         self.attention = AttentionLayer(
-            FullAttention(True, factor, attention_dropout=dropout, output_attention=output_attention),
+            FullAttention(False, factor, attention_dropout=dropout, output_attention=output_attention),
             d_model,
             n_heads
         )
         self.dropout = nn.Dropout(p=dropout)
         nn.init.xavier_uniform_(self.queries)
 
-    def forward(self, period_tokens, patch_token_mask):
-        # period_tokens: [B, N_c, d_model], patch_token_mask: [B, N_c]
+    def forward(self, period_tokens):
+        # period_tokens: [B, N_c, d_model]
         batch_size = period_tokens.shape[0]
         queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)  # [B, K, d_model]
-        attn_mask = PeriodKeyPaddingMask(patch_token_mask.bool(), self.query_num)
-        aligned_tokens, attn = self.attention(queries, period_tokens, period_tokens, attn_mask=attn_mask)
+        aligned_tokens, attn = self.attention(queries, period_tokens, period_tokens, attn_mask=None)
         return self.dropout(aligned_tokens), attn  # [B, K, d_model]
 
 class PeriodAwareEmbedding(nn.Module):
@@ -141,13 +108,13 @@ class PeriodAwareEmbedding(nn.Module):
 
     def forward(self, x, x_mark=None):
         # x: [B, L, C]. x_mark is kept only for interface compatibility.
-        channel_tokens, channel_token_masks, periods = self.tokenizer(x)
+        channel_tokens, periods = self.tokenizer(x)
 
         aligned_channels = []
         align_attns = []
-        for tokens, token_mask in zip(channel_tokens, channel_token_masks):
+        for tokens in channel_tokens:
             # tokens: [B, N_c, d_model] -> aligned: [B, K, d_model]
-            aligned, attn = self.aggregation(tokens, token_mask)
+            aligned, attn = self.aggregation(tokens)
             aligned_channels.append(aligned)
             align_attns.append(attn)
 
