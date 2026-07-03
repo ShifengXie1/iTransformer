@@ -77,8 +77,6 @@ class PeriodAwareEmbedding(nn.Module):
             base_patch_len=base_patch_len,
             dropout=dropout
         )
-        self.time_feature_embedding = nn.Linear(seq_len, d_model)
-        self.dropout = nn.Dropout(p=dropout)
         self.temporal_encoder = Encoder(
             [
                 EncoderLayer(
@@ -95,7 +93,7 @@ class PeriodAwareEmbedding(nn.Module):
         )
 
     def forward(self, x, x_mark=None):
-        # x: [B, L, C]. x_mark: [B, L, T], used as additional covariate tokens.
+        # x: [B, L, C]. x_mark is kept only for interface compatibility.
         channel_tokens, periods = self.tokenizer(x)
 
         variable_tokens = []
@@ -108,9 +106,6 @@ class PeriodAwareEmbedding(nn.Module):
 
         # [B, d_model] * C -> [B, C, d_model]
         variable_tokens = torch.stack(variable_tokens, dim=1)
-        if x_mark is not None:
-            time_tokens = self.time_feature_embedding(x_mark.permute(0, 2, 1))
-            variable_tokens = torch.cat([variable_tokens, self.dropout(time_tokens)], dim=1)
         return variable_tokens, temporal_attns, periods
 
 class CPTA_iTransformer(nn.Module):
@@ -168,15 +163,12 @@ class CPTA_iTransformer(nn.Module):
             x_enc /= stdev
 
 
-        _, _, num_channels = x_enc.shape
-
         # Channel-wise period tokenization and intra-variate attention.
-        # x_enc: [B, L, C] -> variable_tokens: [B, C(+T), d_model]
+        # x_enc: [B, L, C] -> variable_tokens: [B, C, d_model]
         variable_tokens, temporal_attns, periods = self.period_embedding(x_enc, x_mark_enc)
 
         # Cross-variate attention, following the original iTransformer token layout.
         enc_out, cross_attns = self.encoder(variable_tokens, attn_mask=None)
-        enc_out = enc_out[:, :num_channels, :]
 
         # [B, C, d_model] -> [B, C, pred_len] -> [B, pred_len, C]
         dec_out = self.projector(enc_out).permute(0, 2, 1)
@@ -203,6 +195,7 @@ class CPTA_iTransformer(nn.Module):
 
 class Model(CPTA_iTransformer):
     pass
+
 
 
 
