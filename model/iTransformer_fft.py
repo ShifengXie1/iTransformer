@@ -67,29 +67,9 @@ class ChannelWisePeriodTokenizer(nn.Module):
 
         return channel_tokens, periods
 
-class FixedQueryPeriodAggregation(nn.Module):
-    def __init__(self, d_model, n_heads, query_num, factor=1, dropout=0.1, output_attention=False):
-        super(FixedQueryPeriodAggregation, self).__init__()
-        self.query_num = query_num
-        self.queries = nn.Parameter(torch.empty(query_num, d_model))
-        self.attention = AttentionLayer(
-            FullAttention(False, factor, attention_dropout=dropout, output_attention=output_attention),
-            d_model,
-            n_heads
-        )
-        self.dropout = nn.Dropout(p=dropout)
-        nn.init.xavier_uniform_(self.queries)
-
-    def forward(self, period_tokens):
-        # period_tokens: [B, N_c, d_model]
-        batch_size = period_tokens.shape[0]
-        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)  # [B, K, d_model]
-        aligned_tokens, attn = self.attention(queries, period_tokens, period_tokens, attn_mask=None)
-        return self.dropout(aligned_tokens), attn  # [B, K, d_model]
-
 class PeriodAwareEmbedding(nn.Module):
-    def __init__(self, seq_len, d_model, n_heads, query_num, factor=1,
-                 base_patch_len=16, dropout=0.1, output_attention=False):
+    def __init__(self, seq_len, d_model, n_heads, d_ff=None, factor=1,
+                 base_patch_len=16, dropout=0.1, activation='gelu', output_attention=False):
         super(PeriodAwareEmbedding, self).__init__()
         self.tokenizer = ChannelWisePeriodTokenizer(
             seq_len=seq_len,
@@ -97,34 +77,40 @@ class PeriodAwareEmbedding(nn.Module):
             base_patch_len=base_patch_len,
             dropout=dropout
         )
-        self.aggregation = FixedQueryPeriodAggregation(
-            d_model=d_model,
-            n_heads=n_heads,
-            query_num=query_num,
-            factor=factor,
-            dropout=dropout,
-            output_attention=output_attention
+        self.temporal_encoder = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(
+                        FullAttention(False, factor, attention_dropout=dropout,
+                                      output_attention=output_attention), d_model, n_heads),
+                    d_model,
+                    d_ff,
+                    dropout=dropout,
+                    activation=activation
+                )
+            ],
+            norm_layer=torch.nn.LayerNorm(d_model)
         )
 
     def forward(self, x, x_mark=None):
         # x: [B, L, C]. x_mark is kept only for interface compatibility.
         channel_tokens, periods = self.tokenizer(x)
 
-        aligned_channels = []
-        align_attns = []
+        variable_tokens = []
+        temporal_attns = []
         for tokens in channel_tokens:
-            # tokens: [B, N_c, d_model] -> aligned: [B, K, d_model]
-            aligned, attn = self.aggregation(tokens)
-            aligned_channels.append(aligned)
-            align_attns.append(attn)
+            # tokens: [B, M_c, d_model] -> encoded: [B, M_c, d_model]
+            encoded, attn = self.temporal_encoder(tokens, attn_mask=None)
+            variable_tokens.append(encoded[:, -1, :])
+            temporal_attns.append(attn)
 
-        # [B, K, d_model] * C -> [B, C, K, d_model]
-        aligned_channels = torch.stack(aligned_channels, dim=1)
-        return aligned_channels, align_attns, periods
+        # [B, d_model] * C -> [B, C, d_model]
+        variable_tokens = torch.stack(variable_tokens, dim=1)
+        return variable_tokens, temporal_attns, periods
 
 class CPTA_iTransformer(nn.Module):
     """
-    Channel-wise Period Tokenization + fixed-query alignment + iTransformer cross-variate attention.
+    Channel-wise period tokenization + intra-variate attention + iTransformer cross-variate attention.
     """
 
     def __init__(self, configs):
@@ -134,22 +120,22 @@ class CPTA_iTransformer(nn.Module):
         self.output_attention = configs.output_attention
         self.use_norm = configs.use_norm
         self.d_model = configs.d_model
-        self.period_query_num = max(1, int(getattr(configs, 'period_query_num', 4)))
         self.base_patch_len = int(getattr(configs, 'base_patch_len', 16))
 
-        # B L C -> B C K d_model
+        # B L C -> B C d_model
         self.period_embedding = PeriodAwareEmbedding(
             seq_len=configs.seq_len,
             d_model=configs.d_model,
             n_heads=configs.n_heads,
-            query_num=self.period_query_num,
+            d_ff=configs.d_ff,
             factor=configs.factor,
             base_patch_len=self.base_patch_len,
             dropout=configs.dropout,
+            activation=configs.activation,
             output_attention=configs.output_attention
         )
 
-        # Phase-wise iTransformer encoder: for each k, [B, C, d_model] -> [B, C, d_model]
+        # iTransformer encoder: [B, C, d_model] -> [B, C, d_model]
         self.encoder = Encoder(
             [
                 EncoderLayer(
@@ -165,8 +151,8 @@ class CPTA_iTransformer(nn.Module):
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
 
-        # Per-channel head: [B, C, K * d_model] -> [B, C, pred_len]
-        self.projector = nn.Linear(self.period_query_num * configs.d_model, configs.pred_len, bias=True)
+        # Per-channel head: [B, C, d_model] -> [B, C, pred_len]
+        self.projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:
@@ -176,27 +162,15 @@ class CPTA_iTransformer(nn.Module):
             stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
             x_enc /= stdev
 
-        batch_size, _, num_channels = x_enc.shape  # [B, L, C]
 
-        # Channel-wise period tokenization and fixed-query alignment.
-        # x_enc: [B, L, C] -> period_out: [B, C, K, d_model]
-        period_out, period_attns, periods = self.period_embedding(x_enc, x_mark_enc)
+        # Channel-wise period tokenization and intra-variate attention.
+        # x_enc: [B, L, C] -> variable_tokens: [B, C, d_model]
+        variable_tokens, temporal_attns, periods = self.period_embedding(x_enc, x_mark_enc)
 
-        # Phase-wise cross-variate attention.
-        phase_outs = []
-        phase_attns = []
-        for phase_idx in range(self.period_query_num):
-            # [B, C, K, d_model] -> [B, C, d_model]
-            phase_tokens = period_out[:, :, phase_idx, :]
-            phase_tokens, attn = self.encoder(phase_tokens, attn_mask=None)
-            phase_outs.append(phase_tokens)
-            phase_attns.append(attn)
+        # Cross-variate attention, following the original iTransformer token layout.
+        enc_out, cross_attns = self.encoder(variable_tokens, attn_mask=None)
 
-        # [B, C, d_model] * K -> [B, C, K, d_model]
-        enc_out = torch.stack(phase_outs, dim=2)
-
-        # [B, C, K, d_model] -> [B, C, K * d_model] -> [B, pred_len, C]
-        enc_out = enc_out.reshape(batch_size, num_channels, self.period_query_num * self.d_model)
+        # [B, C, d_model] -> [B, C, pred_len] -> [B, pred_len, C]
         dec_out = self.projector(enc_out).permute(0, 2, 1)
 
         if self.use_norm:
@@ -205,8 +179,8 @@ class CPTA_iTransformer(nn.Module):
             dec_out = dec_out + (means[:, 0, :].unsqueeze(1).repeat(1, self.pred_len, 1))
 
         attns = {
-            'period_alignment': period_attns,
-            'cross_variate': phase_attns,
+            'intra_variate': temporal_attns,
+            'cross_variate': cross_attns,
             'periods': periods,
         }
         return dec_out, attns
@@ -221,3 +195,5 @@ class CPTA_iTransformer(nn.Module):
 
 class Model(CPTA_iTransformer):
     pass
+
+
