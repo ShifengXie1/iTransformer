@@ -176,6 +176,9 @@ class CPTA_iTransformer(nn.Module):
         # Channel-wise period tokenization and intra-variate attention.
         # x_enc: [B, L, C] -> variable_tokens: [B, C, d_model]
         variable_tokens, temporal_attns, periods = self.period_embedding(x_enc, x_mark_enc)
+        # Expose the latest batch-level estimate for experiment logging.
+        # There is one period per variable, based on the batch-mean spectrum.
+        self.last_batch_periods = periods
 
         # Single-variate base prediction.
         # [B, C, d_model] -> [B, C, pred_len] -> [B, pred_len, C]
