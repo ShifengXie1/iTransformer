@@ -97,6 +97,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 self.args.data_path,
                 self.args.features,
                 self.args.enc_in,
+                self.args.raw_channel_periods,
             )
 
         time_now = time.time()
@@ -202,7 +203,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
-        batch_mean_periods = None
         run_timestamp = getattr(self.args, 'run_timestamp', time.strftime('%Y%m%d_%H%M%S'))
         folder_path = os.path.join('./test_results', setting, run_timestamp)
         if not os.path.exists(folder_path):
@@ -237,11 +237,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                # Save the fixed train-split periods once for this experiment.
-                if batch_mean_periods is None and self.args.model == 'iTransformer_fft':
-                    model_ref = self.model.module if hasattr(self.model, 'module') else self.model
-                    batch_mean_periods = getattr(model_ref, 'last_batch_periods', None)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
@@ -285,8 +280,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('[{}] {}  \n'.format(run_timestamp, setting))
         f.write('mse:{}, mae:{}'.format(mse, mae))
         f.write('\n')
-        if batch_mean_periods is not None:
-            f.write('fixed_train_periods_by_variable:{}\n'.format(batch_mean_periods))
+        if self.args.model == 'iTransformer_fft':
+            f.write('raw_train_periods_by_variable:{}\n'.format(
+                self.args.raw_channel_periods
+            ))
+            f.write('adjusted_fixed_periods_by_variable:{}\n'.format(
+                self.args.channel_periods
+            ))
         f.write('\n')
         f.close()
 

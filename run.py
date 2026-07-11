@@ -129,10 +129,12 @@ if __name__ == '__main__':
         if args.is_training or not os.path.exists(args.period_cache_path):
             print('Estimating fixed channel periods from the training split...')
             _, period_loader = data_provider(args, 'train')
-            args.channel_periods, args.channel_period_confidence = estimate_channel_periods(
-                period_loader,
-                seq_len=args.seq_len,
-                max_batches=0,
+            (
+                args.channel_periods,
+                args.channel_period_confidence,
+                args.raw_channel_periods,
+            ) = estimate_channel_periods(
+                period_loader, seq_len=args.seq_len, max_batches=0
             )
             save_period_metadata(
                 args.period_cache_path,
@@ -142,24 +144,25 @@ if __name__ == '__main__':
                 args.data_path,
                 args.features,
                 args.enc_in,
+                args.raw_channel_periods,
             )
             print('Saved period cache:', args.period_cache_path)
         else:
-            args.channel_periods, args.channel_period_confidence = load_period_metadata(
-                args.period_cache_path,
-                args.seq_len,
-                args.data_path,
-                args.features,
-                args.enc_in,
+            (
+                args.channel_periods,
+                args.channel_period_confidence,
+                args.raw_channel_periods,
+            ) = load_period_metadata(
+                args.period_cache_path, args.seq_len, args.data_path,
+                args.features, args.enc_in
             )
             print('Loaded period cache:', args.period_cache_path)
 
         if len(args.channel_periods) != args.enc_in:
             raise ValueError(
-                '--channel_periods must contain exactly enc_in values: '
+                'Estimated channel periods must contain exactly enc_in values: '
                 f'expected {args.enc_in}, got {len(args.channel_periods)}'
             )
-        print('Fixed channel periods:', args.channel_periods)
         if args.channel_period_confidence is not None:
             print('Period confidence:', args.channel_period_confidence)
 
