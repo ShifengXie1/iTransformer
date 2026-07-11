@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -52,7 +53,9 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model, path):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        torch.save(model.state_dict(), path + '/' + 'checkpoint.pth')
+        torch.save(model.state_dict(), os.path.join(path, 'checkpoint.pth'))
+        with open(os.path.join(path, 'checkpoint_timestamp.txt'), 'w', encoding='utf-8') as timestamp_file:
+            timestamp_file.write(datetime.now().astimezone().isoformat(timespec='seconds') + '\n')
         self.val_loss_min = val_loss
 
 

@@ -191,7 +191,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
-        folder_path = './test_results/' + setting + '/'
+        run_timestamp = getattr(self.args, 'run_timestamp', time.strftime('%Y%m%d_%H%M%S'))
+        folder_path = os.path.join('./test_results', setting, run_timestamp)
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
@@ -257,22 +258,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print('test shape:', preds.shape, trues.shape)
 
         # result save
-        folder_path = './results/' + setting + '/'
+        folder_path = os.path.join('./results', setting, run_timestamp)
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
         mae, mse, rmse, mape, mspe = metric(preds, trues)
         print('mse:{}, mae:{}'.format(mse, mae))
         f = open("result_long_term_forecast.txt", 'a')
-        f.write(setting + "  \n")
+        f.write('[{}] {}  \n'.format(run_timestamp, setting))
         f.write('mse:{}, mae:{}'.format(mse, mae))
         f.write('\n')
         f.write('\n')
         f.close()
 
-        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
-        np.save(folder_path + 'pred.npy', preds)
-        np.save(folder_path + 'true.npy', trues)
+        np.save(os.path.join(folder_path, 'metrics.npy'), np.array([mae, mse, rmse, mape, mspe]))
+        np.save(os.path.join(folder_path, 'pred.npy'), preds)
+        np.save(os.path.join(folder_path, 'true.npy'), trues)
 
         return
 
@@ -320,10 +321,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
 
         # result save
-        folder_path = './results/' + setting + '/'
+        run_timestamp = getattr(self.args, 'run_timestamp', time.strftime('%Y%m%d_%H%M%S'))
+        folder_path = os.path.join('./results', setting, run_timestamp)
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
-        np.save(folder_path + 'real_prediction.npy', preds)
+        np.save(os.path.join(folder_path, 'real_prediction.npy'), preds)
 
         return

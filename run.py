@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime
 import torch
 from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from experiments.exp_long_term_forecasting_partial import Exp_Long_Term_Forecast_Partial
@@ -92,6 +93,9 @@ if __name__ == '__main__':
                                                                            'you can select [partial_start_index, min(enc_in + partial_start_index, N)]')
 
     args = parser.parse_args()
+    # Reuse one timestamp for every artifact produced by this process so that
+    # test plots, metrics and predictions from the same run stay grouped.
+    args.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
