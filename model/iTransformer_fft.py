@@ -51,11 +51,46 @@ class MaskedEncoder(nn.Module):
         return x, attns
 
 
-class CTFPeriodEmbedding(nn.Module):
-    """CTF-style fixed-period patch embedding without interpolation."""
+class PatchBroadcastLayer(nn.Module):
+    """Broadcast CTF Global Token information back to Patch Tokens."""
 
-    def __init__(self, seq_len, n_vars, d_model, channel_periods,
-                 num_channel_tokens=4, dropout=0.1):
+    def __init__(self, d_model, n_heads, d_ff, dropout=0.1,
+                 activation='gelu', output_attention=False):
+        super().__init__()
+        self.output_attention = output_attention
+        self.attention = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.activation = F.gelu if activation == 'gelu' else F.relu
+
+    def forward(self, patch_groups, global_tokens):
+        outputs = []
+        attns = []
+        for channel_idx, patches in enumerate(patch_groups):
+            channel_global = global_tokens[:, channel_idx, :, :]
+            update, attn = self.attention(
+                patches, channel_global, channel_global,
+                need_weights=self.output_attention,
+                average_attn_weights=False,
+            )
+            x = self.norm1(patches + self.dropout(update))
+            y = self.linear2(self.dropout(
+                self.activation(self.linear1(x))
+            ))
+            outputs.append(self.norm2(x + self.dropout(y)))
+            attns.append(attn)
+        return outputs, attns
+
+
+class PeriodPatchEmbedding(nn.Module):
+    """Variable-wise fixed-period patch embedding without interpolation."""
+
+    def __init__(self, seq_len, n_vars, d_model, channel_periods, dropout=0.1):
         super().__init__()
         if len(channel_periods) != n_vars:
             raise ValueError(
@@ -65,8 +100,6 @@ class CTFPeriodEmbedding(nn.Module):
         self.n_vars = int(n_vars)
         self.d_model = int(d_model)
         self.channel_periods = [int(p) for p in channel_periods]
-        self.num_channel_tokens = int(num_channel_tokens)
-
         for period in self.channel_periods:
             if period < 1 or period > self.seq_len:
                 raise ValueError(
@@ -74,9 +107,6 @@ class CTFPeriodEmbedding(nn.Module):
                 )
 
         unique_periods = sorted(set(self.channel_periods))
-        self.period_to_scale = {
-            period: idx for idx, period in enumerate(unique_periods)
-        }
         self.patch_embeddings = nn.ModuleDict({
             str(period): nn.Linear(period, d_model)
             for period in unique_periods
@@ -86,13 +116,8 @@ class CTFPeriodEmbedding(nn.Module):
             torch.zeros(1, max_num_patches, d_model)
         )
         self.channel_embedding = nn.Embedding(n_vars, d_model)
-        self.scale_embedding = nn.Embedding(len(unique_periods), d_model)
-        self.base_channel_tokens = nn.Parameter(
-            torch.randn(1, self.num_channel_tokens, d_model)
-        )
         self.dropout = nn.Dropout(dropout)
         nn.init.normal_(self.position_embedding, std=0.02)
-        nn.init.normal_(self.base_channel_tokens, std=0.02)
 
     def forward(self, x):
         # x: [B, L, C]
@@ -113,60 +138,48 @@ class CTFPeriodEmbedding(nn.Module):
             local_tokens = self.patch_embeddings[str(patch_len)](patches)
 
             channel_idx_tensor = torch.tensor(channel_idx, device=x.device)
-            scale_idx_tensor = torch.tensor(
-                self.period_to_scale[patch_len], device=x.device
+            identity = self.channel_embedding(channel_idx_tensor).view(
+                1, 1, self.d_model
             )
-            identity = (
-                self.channel_embedding(channel_idx_tensor)
-                + self.scale_embedding(scale_idx_tensor)
-            ).view(1, 1, self.d_model)
             local_tokens = (
                 local_tokens
                 + self.position_embedding[:, :num_patches, :]
                 + identity
             )
-            channel_tokens = (
-                self.base_channel_tokens.expand(batch_size, -1, -1)
-                + identity
-            )
-            # CTF layout: [local tokens, channel tokens] for each channel.
-            token_groups.append(torch.cat([local_tokens, channel_tokens], dim=1))
+            token_groups.append(local_tokens)
             num_patches_list.append(num_patches)
 
         return self.dropout(torch.cat(token_groups, dim=1)), num_patches_list
 
     def build_intra_mask(self, num_patches_list, device):
-        """Make Channel Tokens strictly summarize their own local tokens."""
-        group_sizes = [n + self.num_channel_tokens for n in num_patches_list]
-        total_tokens = sum(group_sizes)
+        """Restrict each Patch Token to its own variable."""
+        total_tokens = sum(num_patches_list)
         allowed = torch.zeros(
             total_tokens, total_tokens, dtype=torch.bool, device=device
         )
         offset = 0
-        for num_patches, group_size in zip(num_patches_list, group_sizes):
-            local_slice = slice(offset, offset + num_patches)
-            channel_slice = slice(offset + num_patches, offset + group_size)
-            allowed[local_slice, local_slice] = True
-            allowed[channel_slice, local_slice] = True
-            offset += group_size
+        for num_patches in num_patches_list:
+            patch_slice = slice(offset, offset + num_patches)
+            allowed[patch_slice, patch_slice] = True
+            offset += num_patches
         # nn.MultiheadAttention: True means forbidden.
         return ~allowed
 
-    def extract_channel_tokens(self, x, num_patches_list):
+    @staticmethod
+    def split_patch_tokens(x, num_patches_list):
         groups = []
         offset = 0
         for num_patches in num_patches_list:
-            start = offset + num_patches
-            end = start + self.num_channel_tokens
-            groups.append(x[:, start:end, :])
+            end = offset + num_patches
+            groups.append(x[:, offset:end, :])
             offset = end
-        return torch.stack(groups, dim=1)  # [B, C, M, D]
+        return groups
 
 
 class CPTA_iTransformer(nn.Module):
     """
-    Fixed period-aware patching + CTF-style Channel Tokens + single-variate
-    base prediction + gated cross-variate residual correction.
+    Period-aware Patch Tokens + single-variate Patch Transformer prediction
+    + CTF-style Global Token routing + Patch Token fusion prediction.
     """
 
     def __init__(self, configs):
@@ -177,10 +190,6 @@ class CPTA_iTransformer(nn.Module):
         self.use_norm = configs.use_norm
         self.d_model = configs.d_model
         self.n_vars = configs.enc_in
-        self.num_channel_tokens = int(
-            getattr(configs, 'num_channel_tokens',
-                    getattr(configs, 'period_query_num', 4))
-        )
         channel_periods = getattr(configs, 'channel_periods', None)
         if channel_periods is None:
             raise ValueError(
@@ -190,9 +199,9 @@ class CPTA_iTransformer(nn.Module):
         self.channel_periods = [int(p) for p in channel_periods]
         self.last_batch_periods = list(self.channel_periods)
 
-        self.period_embedding = CTFPeriodEmbedding(
+        self.period_embedding = PeriodPatchEmbedding(
             configs.seq_len, self.n_vars, configs.d_model,
-            self.channel_periods, self.num_channel_tokens, configs.dropout
+            self.channel_periods, configs.dropout
         )
 
         self.intra_encoder = MaskedEncoder([
@@ -204,39 +213,130 @@ class CPTA_iTransformer(nn.Module):
             for _ in range(max(1, int(getattr(configs, 'intra_layers', 1))))
         ])
 
-        feature_dim = self.num_channel_tokens * configs.d_model
-        self.self_projector = nn.Linear(feature_dim, configs.pred_len)
+        # Global Tokens are used only as CTF-style cross-variable routers.
+        # Forecast heads always consume Patch Tokens.
+        self.num_global_tokens = int(
+            getattr(configs, 'num_global_tokens', 4)
+        )
+        if self.num_global_tokens < 1:
+            raise ValueError('num_global_tokens must be at least 1')
+        self.global_tokens = nn.Parameter(
+            torch.randn(1, self.num_global_tokens, configs.d_model)
+        )
+        nn.init.normal_(self.global_tokens, std=0.02)
+
+        # Variables with the same period share a projection head, while
+        # different patch counts retain their full token sequence.
+        self.period_feature_dims = {
+            period: (self.seq_len // period) * configs.d_model
+            for period in sorted(set(self.channel_periods))
+        }
+        self.self_projectors = nn.ModuleDict({
+            str(period): nn.Linear(feature_dim, configs.pred_len)
+            for period, feature_dim in self.period_feature_dims.items()
+        })
 
         cross_layers = []
-        for layer_idx in range(max(1, configs.e_layers)):
+        for _ in range(max(1, configs.e_layers)):
             cross_layers.append(MaskedEncoderLayer(
                 configs.d_model, configs.n_heads, configs.d_ff,
                 configs.dropout, configs.activation, configs.output_attention,
-                input_residual=layer_idx > 0,
+                input_residual=True,
             ))
         self.cross_encoder = MaskedEncoder(cross_layers)
-        self.delta_projector = nn.Linear(feature_dim, configs.pred_len)
-        self.gate_projector = nn.Linear(feature_dim * 2, configs.pred_len)
+        self.patch_broadcast = PatchBroadcastLayer(
+            configs.d_model, configs.n_heads, configs.d_ff,
+            configs.dropout, configs.activation, configs.output_attention,
+        )
+        self.delta_projectors = nn.ModuleDict({
+            str(period): nn.Linear(feature_dim, configs.pred_len)
+            for period, feature_dim in self.period_feature_dims.items()
+        })
+        self.gate_projectors = nn.ModuleDict({
+            str(period): nn.Linear(feature_dim * 2, configs.pred_len)
+            for period, feature_dim in self.period_feature_dims.items()
+        })
         self.head_dropout = nn.Dropout(configs.dropout)
 
-        # Begin as a single-variate forecaster; learn cross-variate correction.
-        nn.init.zeros_(self.delta_projector.weight)
-        nn.init.zeros_(self.delta_projector.bias)
-        nn.init.zeros_(self.gate_projector.weight)
-        nn.init.constant_(self.gate_projector.bias, -2.0)
+        # Start close to the single-variate forecast without blocking gradients
+        # from reaching the cross-variate Transformer on the first update.
+        for projector in self.delta_projectors.values():
+            nn.init.xavier_uniform_(projector.weight, gain=0.1)
+            nn.init.zeros_(projector.bias)
+        for projector in self.gate_projectors.values():
+            nn.init.zeros_(projector.weight)
+            nn.init.constant_(projector.bias, -2.0)
 
-    def _build_cross_mask(self, device):
-        channel_ids = torch.arange(self.n_vars, device=device)
-        channel_ids = channel_ids.repeat_interleave(self.num_channel_tokens)
-        slot_ids = torch.arange(self.num_channel_tokens, device=device)
-        slot_ids = slot_ids.repeat(self.n_vars)
-        # Match CTF's global-token routing: a Channel Token communicates with
-        # the same token slot of other variables, never with its own channel.
-        allowed = (
-            channel_ids[:, None].ne(channel_ids[None, :])
-            & slot_ids[:, None].eq(slot_ids[None, :])
+    def _append_global_tokens(self, patch_groups):
+        token_groups = []
+        for channel_idx, patches in enumerate(patch_groups):
+            identity = self.period_embedding.channel_embedding.weight[
+                channel_idx
+            ].view(1, 1, self.d_model)
+            global_token = (
+                self.global_tokens.expand(patches.shape[0], -1, -1)
+                + identity
+            )
+            token_groups.append(torch.cat([patches, global_token], dim=1))
+        return torch.cat(token_groups, dim=1)
+
+    def _build_ctf_mask(self, num_patches_list, device):
+        """Reproduce CTF routing while keeping prediction Patch-based."""
+        group_sizes = [
+            num_patches + self.num_global_tokens
+            for num_patches in num_patches_list
+        ]
+        total_tokens = sum(group_sizes)
+        allowed = torch.zeros(
+            total_tokens, total_tokens, dtype=torch.bool, device=device
         )
+
+        query_offset = 0
+        for query_channel, (query_patches, query_size) in enumerate(zip(
+                num_patches_list, group_sizes)):
+            # Exactly as in CTF: every token can read its own Patch Tokens.
+            own_patch_slice = slice(query_offset,
+                                    query_offset + query_patches)
+            query_group_slice = slice(query_offset,
+                                      query_offset + query_size)
+            allowed[query_group_slice, own_patch_slice] = True
+
+            key_offset = 0
+            for key_channel, (key_patches, key_size) in enumerate(zip(
+                    num_patches_list, group_sizes)):
+                if key_channel != query_channel:
+                    for slot in range(self.num_global_tokens):
+                        query_idx = query_offset + query_patches + slot
+                        key_idx = key_offset + key_patches + slot
+                        allowed[query_idx, key_idx] = True
+                key_offset += key_size
+            query_offset += query_size
         return ~allowed
+
+    def _extract_global_tokens(self, x, num_patches_list):
+        global_groups = []
+        offset = 0
+        for num_patches in num_patches_list:
+            start = offset + num_patches
+            end = start + self.num_global_tokens
+            global_groups.append(x[:, start:end, :])
+            offset = end
+        return torch.stack(global_groups, dim=1)
+
+    def _project_by_period(self, token_groups, projectors):
+        predictions = []
+        features = []
+        for period, tokens in zip(self.channel_periods, token_groups):
+            feature = self.head_dropout(tokens.flatten(start_dim=1))
+            expected_dim = self.period_feature_dims[period]
+            if feature.shape[-1] != expected_dim:
+                raise RuntimeError(
+                    f'Period {period} produced feature dim {feature.shape[-1]}, '
+                    f'expected {expected_dim}'
+                )
+            features.append(feature)
+            predictions.append(projectors[str(period)](feature))
+        return torch.stack(predictions, dim=-1), features
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:
@@ -252,36 +352,41 @@ class CPTA_iTransformer(nn.Module):
             num_patches_list, x_enc.device
         )
         intra_out, intra_attns = self.intra_encoder(all_tokens, intra_mask)
-        self_tokens = self.period_embedding.extract_channel_tokens(
+        self_patch_tokens = self.period_embedding.split_patch_tokens(
             intra_out, num_patches_list
         )
-        self_features = self.head_dropout(self_tokens.flatten(start_dim=2))
-        self_pred = self.self_projector(self_features).permute(0, 2, 1)
+        self_pred, self_features = self._project_by_period(
+            self_patch_tokens, self.self_projectors
+        )
 
         if self.n_vars > 1:
-            batch_size = x_enc.shape[0]
-            cross_input = self_tokens.reshape(
-                batch_size,
-                self.n_vars * self.num_channel_tokens,
-                self.d_model,
-            )
+            cross_input = self._append_global_tokens(self_patch_tokens)
             cross_out, cross_attns = self.cross_encoder(
-                cross_input, self._build_cross_mask(x_enc.device)
+                cross_input,
+                self._build_ctf_mask(num_patches_list, x_enc.device),
             )
-            cross_tokens = cross_out.reshape(
-                batch_size, self.n_vars,
-                self.num_channel_tokens, self.d_model
+            global_tokens = self._extract_global_tokens(
+                cross_out, num_patches_list
             )
-            cross_features = self.head_dropout(
-                cross_tokens.flatten(start_dim=2)
+            cross_patch_tokens, broadcast_attns = self.patch_broadcast(
+                self_patch_tokens, global_tokens
             )
-            delta = self.delta_projector(cross_features).permute(0, 2, 1)
-            gate = torch.sigmoid(self.gate_projector(torch.cat(
-                [self_features, cross_features], dim=-1
-            ))).permute(0, 2, 1)
+            delta, cross_features = self._project_by_period(
+                cross_patch_tokens, self.delta_projectors
+            )
+            gates = []
+            for period, self_feature, cross_feature in zip(
+                    self.channel_periods, self_features, cross_features):
+                gates.append(torch.sigmoid(
+                    self.gate_projectors[str(period)](torch.cat(
+                        [self_feature, cross_feature], dim=-1
+                    ))
+                ))
+            gate = torch.stack(gates, dim=-1)
             dec_out = self_pred + gate * delta
         else:
             cross_attns = []
+            broadcast_attns = []
             gate = torch.zeros_like(self_pred)
             dec_out = self_pred
 
@@ -292,6 +397,7 @@ class CPTA_iTransformer(nn.Module):
         attns = {
             'intra_variate': intra_attns,
             'cross_variate': cross_attns,
+            'cross_to_patch': broadcast_attns,
             'periods': list(self.channel_periods),
             'num_patches': list(num_patches_list),
             'fusion_gate': gate,

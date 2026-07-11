@@ -88,14 +88,10 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
-    parser.add_argument('--base_patch_len', type=int, default=48,
-                        help='resampled patch length for channel-wise period tokenization')
-    parser.add_argument('--period_query_num', type=int, default=4,
-                        help='number of fixed learnable queries for period alignment')
-    parser.add_argument('--num_channel_tokens', type=int, default=4,
-                        help='number of CTF-style Channel Tokens per variable')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
+    parser.add_argument('--num_global_tokens', type=int, default=4,
+                        help='CTF-style Global Tokens per variable; used only for cross-variate routing')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
@@ -197,9 +193,9 @@ if __name__ == '__main__':
                 args.des,
                 args.class_strategy, ii)
             if args.model == 'iTransformer_fft':
-                setting += '_cp{}_ct{}'.format(
+                setting += '_cp{}_gt{}'.format(
                     '-'.join(map(str, args.channel_periods)),
-                    args.num_channel_tokens,
+                    args.num_global_tokens,
                 )
 
             exp = Exp(args)  # set experiments
@@ -235,9 +231,9 @@ if __name__ == '__main__':
             args.des,
             args.class_strategy, ii)
         if args.model == 'iTransformer_fft':
-            setting += '_cp{}_ct{}'.format(
+            setting += '_cp{}_gt{}'.format(
                 '-'.join(map(str, args.channel_periods)),
-                args.num_channel_tokens,
+                args.num_global_tokens,
             )
 
         exp = Exp(args)  # set experiments
