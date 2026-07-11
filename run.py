@@ -1,8 +1,15 @@
 import argparse
 from datetime import datetime
+import os
 import torch
 from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
 from experiments.exp_long_term_forecasting_partial import Exp_Long_Term_Forecast_Partial
+from data_provider.data_factory import data_provider
+from utils.periods import (
+    estimate_channel_periods,
+    load_period_metadata,
+    save_period_metadata,
+)
 import random
 import numpy as np
 
@@ -85,6 +92,10 @@ if __name__ == '__main__':
                         help='resampled patch length for channel-wise period tokenization')
     parser.add_argument('--period_query_num', type=int, default=4,
                         help='number of fixed learnable queries for period alignment')
+    parser.add_argument('--num_channel_tokens', type=int, default=4,
+                        help='number of CTF-style Channel Tokens per variable')
+    parser.add_argument('--intra_layers', type=int, default=1,
+                        help='strictly intra-variate masked encoder layers')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
@@ -103,6 +114,54 @@ if __name__ == '__main__':
         device_ids = args.devices.split(',')
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
+
+    if args.model == 'iTransformer_fft':
+        period_cache_name = '{}_{}_sl{}_c{}.json'.format(
+            os.path.splitext(os.path.basename(args.data_path))[0],
+            args.features,
+            args.seq_len,
+            args.enc_in,
+        )
+        args.period_cache_path = os.path.join(
+            args.checkpoints, 'period_cache', period_cache_name
+        )
+
+        if args.is_training or not os.path.exists(args.period_cache_path):
+            print('Estimating fixed channel periods from the training split...')
+            _, period_loader = data_provider(args, 'train')
+            args.channel_periods, args.channel_period_confidence = estimate_channel_periods(
+                period_loader,
+                seq_len=args.seq_len,
+                max_batches=0,
+            )
+            save_period_metadata(
+                args.period_cache_path,
+                args.channel_periods,
+                args.channel_period_confidence,
+                args.seq_len,
+                args.data_path,
+                args.features,
+                args.enc_in,
+            )
+            print('Saved period cache:', args.period_cache_path)
+        else:
+            args.channel_periods, args.channel_period_confidence = load_period_metadata(
+                args.period_cache_path,
+                args.seq_len,
+                args.data_path,
+                args.features,
+                args.enc_in,
+            )
+            print('Loaded period cache:', args.period_cache_path)
+
+        if len(args.channel_periods) != args.enc_in:
+            raise ValueError(
+                '--channel_periods must contain exactly enc_in values: '
+                f'expected {args.enc_in}, got {len(args.channel_periods)}'
+            )
+        print('Fixed channel periods:', args.channel_periods)
+        if args.channel_period_confidence is not None:
+            print('Period confidence:', args.channel_period_confidence)
 
     print('Args in experiment:')
     print(args)
@@ -134,6 +193,11 @@ if __name__ == '__main__':
                 args.distil,
                 args.des,
                 args.class_strategy, ii)
+            if args.model == 'iTransformer_fft':
+                setting += '_cp{}_ct{}'.format(
+                    '-'.join(map(str, args.channel_periods)),
+                    args.num_channel_tokens,
+                )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -167,6 +231,11 @@ if __name__ == '__main__':
             args.distil,
             args.des,
             args.class_strategy, ii)
+        if args.model == 'iTransformer_fft':
+            setting += '_cp{}_ct{}'.format(
+                '-'.join(map(str, args.channel_periods)),
+                args.num_channel_tokens,
+            )
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

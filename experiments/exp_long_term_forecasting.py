@@ -2,6 +2,7 @@ from data_provider.data_factory import data_provider
 from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
+from utils.periods import save_period_metadata
 import torch
 import torch.nn as nn
 from torch import optim
@@ -87,6 +88,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
             os.makedirs(path)
+        if self.args.model == 'iTransformer_fft':
+            save_period_metadata(
+                os.path.join(path, 'channel_periods.json'),
+                self.args.channel_periods,
+                self.args.channel_period_confidence,
+                self.args.seq_len,
+                self.args.data_path,
+                self.args.features,
+                self.args.enc_in,
+            )
 
         time_now = time.time()
 
@@ -227,7 +238,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                # Save the period estimate once, using the first test batch.
+                # Save the fixed train-split periods once for this experiment.
                 if batch_mean_periods is None and self.args.model == 'iTransformer_fft':
                     model_ref = self.model.module if hasattr(self.model, 'module') else self.model
                     batch_mean_periods = getattr(model_ref, 'last_batch_periods', None)
@@ -275,7 +286,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('mse:{}, mae:{}'.format(mse, mae))
         f.write('\n')
         if batch_mean_periods is not None:
-            f.write('first_batch_mean_periods_by_variable:{}\n'.format(batch_mean_periods))
+            f.write('fixed_train_periods_by_variable:{}\n'.format(batch_mean_periods))
         f.write('\n')
         f.close()
 

@@ -3,6 +3,7 @@ export CUDA_VISIBLE_DEVICES=1
 model_name=iTransformer_fft
 base_patch_len=48
 period_query_num=4
+num_channel_tokens=4
 Seq_len=336
 
 python -u run.py \
@@ -21,6 +22,7 @@ python -u run.py \
   --c_out 7 \
   --base_patch_len $base_patch_len \
   --period_query_num $period_query_num \
+  --num_channel_tokens $num_channel_tokens \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
@@ -42,6 +44,7 @@ python -u run.py \
   --c_out 7 \
   --base_patch_len $base_patch_len \
   --period_query_num $period_query_num \
+  --num_channel_tokens $num_channel_tokens \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
@@ -63,6 +66,7 @@ python -u run.py \
   --c_out 7 \
   --base_patch_len $base_patch_len \
   --period_query_num $period_query_num \
+  --num_channel_tokens $num_channel_tokens \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
@@ -84,6 +88,7 @@ python -u run.py \
   --c_out 7 \
   --base_patch_len $base_patch_len \
   --period_query_num $period_query_num \
+  --num_channel_tokens $num_channel_tokens \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
