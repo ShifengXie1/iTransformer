@@ -110,7 +110,8 @@ class PeriodAwareEmbedding(nn.Module):
 
 class CPTA_iTransformer(nn.Module):
     """
-    Channel-wise period tokenization + intra-variate attention + iTransformer cross-variate attention.
+    Channel-wise period tokenization + intra-variate self-attention
+    + gated cross-variate attention fusion.
     """
 
     def __init__(self, configs):
@@ -135,7 +136,13 @@ class CPTA_iTransformer(nn.Module):
             output_attention=configs.output_attention
         )
 
-        # iTransformer encoder: [B, C, d_model] -> [B, C, d_model]
+        # Single-variate prediction head: each channel first predicts itself
+        # from its own temporal self-attention representation.
+        self.self_projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
+
+        # Cross-variate encoder: [B, C, d_model] -> [B, C, d_model].
+        # Q, K, V all come from variable_tokens, so K/V contain the query
+        # channel itself and all other channels.
         self.encoder = Encoder(
             [
                 EncoderLayer(
@@ -151,8 +158,11 @@ class CPTA_iTransformer(nn.Module):
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
 
-        # Per-channel head: [B, C, d_model] -> [B, C, pred_len]
-        self.projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
+        # Cross-variate residual correction and gate.
+        # Delta corrects the single-variate prediction, while gate controls
+        # how much cross-variate information is injected for each horizon.
+        self.delta_projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
+        self.gate_projector = nn.Linear(configs.d_model * 2, configs.pred_len, bias=True)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:
@@ -167,11 +177,22 @@ class CPTA_iTransformer(nn.Module):
         # x_enc: [B, L, C] -> variable_tokens: [B, C, d_model]
         variable_tokens, temporal_attns, periods = self.period_embedding(x_enc, x_mark_enc)
 
+        # Single-variate base prediction.
+        # [B, C, d_model] -> [B, C, pred_len] -> [B, pred_len, C]
+        self_pred = self.self_projector(variable_tokens).permute(0, 2, 1)
+
         # Cross-variate attention, following the original iTransformer token layout.
+        # K/V include the current channel itself because no diagonal mask is used.
         enc_out, cross_attns = self.encoder(variable_tokens, attn_mask=None)
 
-        # [B, C, d_model] -> [B, C, pred_len] -> [B, pred_len, C]
-        dec_out = self.projector(enc_out).permute(0, 2, 1)
+        # Gated residual fusion:
+        # final = single-variate prediction + gate * cross-variate correction.
+        # [B, C, d_model] -> [B, pred_len, C]
+        delta = self.delta_projector(enc_out).permute(0, 2, 1)
+        gate = torch.sigmoid(
+            self.gate_projector(torch.cat([variable_tokens, enc_out], dim=-1))
+        ).permute(0, 2, 1)
+        dec_out = self_pred + gate * delta
 
         if self.use_norm:
             # De-Normalization from Non-stationary Transformer
@@ -182,6 +203,7 @@ class CPTA_iTransformer(nn.Module):
             'intra_variate': temporal_attns,
             'cross_variate': cross_attns,
             'periods': periods,
+            'fusion_gate': gate,
         }
         return dec_out, attns
 
