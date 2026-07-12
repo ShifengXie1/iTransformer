@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 from datetime import datetime
 import os
 import torch
@@ -90,8 +91,6 @@ if __name__ == '__main__':
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
-    parser.add_argument('--num_global_tokens', type=int, default=4,
-                        help='CTF-style Global Tokens per variable; used only for cross-variate routing')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
@@ -128,7 +127,6 @@ if __name__ == '__main__':
             (
                 args.channel_periods,
                 args.channel_period_confidence,
-                args.raw_channel_periods,
             ) = estimate_channel_periods(
                 period_loader, seq_len=args.seq_len, max_batches=0
             )
@@ -140,14 +138,12 @@ if __name__ == '__main__':
                 args.data_path,
                 args.features,
                 args.enc_in,
-                args.raw_channel_periods,
             )
             print('Saved period cache:', args.period_cache_path)
         else:
             (
                 args.channel_periods,
                 args.channel_period_confidence,
-                args.raw_channel_periods,
             ) = load_period_metadata(
                 args.period_cache_path, args.seq_len, args.data_path,
                 args.features, args.enc_in
@@ -159,6 +155,13 @@ if __name__ == '__main__':
                 'Estimated channel periods must contain exactly enc_in values: '
                 f'expected {args.enc_in}, got {len(args.channel_periods)}'
             )
+        period_counts = Counter(args.channel_periods)
+        max_period_count = max(period_counts.values())
+        args.cross_period = min(
+            period for period, count in period_counts.items()
+            if count == max_period_count
+        )
+        print('Cross-variate mode period:', args.cross_period)
         if args.channel_period_confidence is not None:
             print('Period confidence:', args.channel_period_confidence)
 
@@ -193,9 +196,9 @@ if __name__ == '__main__':
                 args.des,
                 args.class_strategy, ii)
             if args.model == 'iTransformer_fft':
-                setting += '_cp{}_gt{}'.format(
+                setting += '_cp{}_xp{}'.format(
                     '-'.join(map(str, args.channel_periods)),
-                    args.num_global_tokens,
+                    args.cross_period,
                 )
 
             exp = Exp(args)  # set experiments
@@ -231,9 +234,9 @@ if __name__ == '__main__':
             args.des,
             args.class_strategy, ii)
         if args.model == 'iTransformer_fft':
-            setting += '_cp{}_gt{}'.format(
+            setting += '_cp{}_xp{}'.format(
                 '-'.join(map(str, args.channel_periods)),
-                args.num_global_tokens,
+                args.cross_period,
             )
 
         exp = Exp(args)  # set experiments

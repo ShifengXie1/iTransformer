@@ -2,7 +2,6 @@ export CUDA_VISIBLE_DEVICES=1
 
 model_name=iTransformer_fft
 seq_len=336
-num_global_tokens=4
 
 python -u run.py \
   --is_training 1 \
@@ -16,7 +15,6 @@ python -u run.py \
   --pred_len 96 \
   --e_layers 2 \
   --enc_in 7 \
-  --num_global_tokens $num_global_tokens \
   --dec_in 7 \
   --c_out 7 \
   --des 'Exp' \
@@ -36,7 +34,6 @@ python -u run.py \
   --pred_len 192 \
   --e_layers 2 \
   --enc_in 7 \
-  --num_global_tokens $num_global_tokens \
   --dec_in 7 \
   --c_out 7 \
   --des 'Exp' \
@@ -56,7 +53,6 @@ python -u run.py \
   --pred_len 336 \
   --e_layers 2 \
   --enc_in 7 \
-  --num_global_tokens $num_global_tokens \
   --dec_in 7 \
   --c_out 7 \
   --des 'Exp' \
@@ -76,7 +72,6 @@ python -u run.py \
   --pred_len 720 \
   --e_layers 2 \
   --enc_in 7 \
-  --num_global_tokens $num_global_tokens \
   --dec_in 7 \
   --c_out 7 \
   --des 'Exp' \

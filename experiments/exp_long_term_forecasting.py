@@ -97,7 +97,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 self.args.data_path,
                 self.args.features,
                 self.args.enc_in,
-                self.args.raw_channel_periods,
             )
 
         time_now = time.time()
@@ -281,11 +280,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('mse:{}, mae:{}'.format(mse, mae))
         f.write('\n')
         if self.args.model == 'iTransformer_fft':
-            f.write('raw_train_periods_by_variable:{}\n'.format(
-                self.args.raw_channel_periods
-            ))
-            f.write('adjusted_fixed_periods_by_variable:{}\n'.format(
+            f.write('fft_periods_by_variable:{}\n'.format(
                 self.args.channel_periods
+            ))
+            f.write('cross_period_mode:{}\n'.format(
+                self.args.cross_period
             ))
         f.write('\n')
         f.close()
