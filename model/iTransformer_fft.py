@@ -53,34 +53,6 @@ class MaskedEncoder(nn.Module):
         return x, attns
 
 
-class FutureTokenGenerator(nn.Module):
-    """Generate future Patch Tokens by attending to encoded history Tokens."""
-
-    def __init__(self, d_model, n_heads, d_ff, dropout=0.1,
-                 activation='gelu', output_attention=False):
-        super().__init__()
-        self.output_attention = output_attention
-        self.attention = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.linear1 = nn.Linear(d_model, d_ff)
-        self.linear2 = nn.Linear(d_ff, d_model)
-        self.activation = F.gelu if activation == 'gelu' else F.relu
-
-    def forward(self, future_queries, history_tokens):
-        update, attn = self.attention(
-            future_queries, history_tokens, history_tokens,
-            need_weights=self.output_attention,
-            average_attn_weights=False,
-        )
-        x = self.norm1(future_queries + self.dropout(update))
-        y = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        return self.norm2(x + self.dropout(y)), attn
-
-
 class PeriodPatchEmbedding(nn.Module):
     """Variable-wise fixed-period patch embedding without interpolation."""
 
@@ -172,8 +144,8 @@ class PeriodPatchEmbedding(nn.Module):
 
 class CPTA_iTransformer(nn.Module):
     """
-    Variable-period self forecasting with future Patch Tokens, plus a
-    mode-period cross-variate Token correction branch.
+    Variable-period Patch Token forecasting with iTransformer-style linear
+    prediction heads, plus a mode-period cross-variate correction branch.
     """
 
     def __init__(self, configs):
@@ -207,21 +179,12 @@ class CPTA_iTransformer(nn.Module):
             for _ in range(max(1, int(getattr(configs, 'intra_layers', 1))))
         ])
 
-        unique_periods = sorted(set(self.channel_periods))
-        self.self_future_queries = nn.ParameterDict({
-            str(period): nn.Parameter(torch.randn(
-                1, (self.pred_len + period - 1) // period, configs.d_model
-            ))
-            for period in unique_periods
-        })
-        self.self_future_generator = FutureTokenGenerator(
-            configs.d_model, configs.n_heads, configs.d_ff,
-            configs.dropout, configs.activation, configs.output_attention,
+        # As in iTransformer, map every encoded Token directly from d_model
+        # to the complete prediction horizon. Patch-level forecasts belonging
+        # to the same variable are averaged into one variable forecast.
+        self.self_projector = nn.Linear(
+            configs.d_model, configs.pred_len, bias=True
         )
-        self.self_patch_decoders = nn.ModuleDict({
-            str(period): nn.Linear(configs.d_model, period)
-            for period in unique_periods
-        })
 
         period_counts = Counter(self.channel_periods)
         max_count = max(period_counts.values())
@@ -250,26 +213,14 @@ class CPTA_iTransformer(nn.Module):
                 input_residual=layer_idx > 0,
             ))
         self.cross_encoder = MaskedEncoder(cross_layers)
-        self.cross_future_query = nn.Parameter(torch.randn(
-            1,
-            (self.pred_len + self.cross_period - 1) // self.cross_period,
-            configs.d_model,
-        ))
-        self.cross_future_generator = FutureTokenGenerator(
-            configs.d_model, configs.n_heads, configs.d_ff,
-            configs.dropout, configs.activation, configs.output_attention,
-        )
-        self.cross_patch_decoder = nn.Linear(
-            configs.d_model, self.cross_period
+        self.cross_projector = nn.Linear(
+            configs.d_model, configs.pred_len, bias=True
         )
         self.gate_projector = nn.Linear(2, 1)
         self.head_dropout = nn.Dropout(configs.dropout)
 
-        for queries in self.self_future_queries.values():
-            nn.init.normal_(queries, std=0.02)
-        nn.init.normal_(self.cross_future_query, std=0.02)
-        nn.init.xavier_uniform_(self.cross_patch_decoder.weight, gain=0.1)
-        nn.init.zeros_(self.cross_patch_decoder.bias)
+        nn.init.xavier_uniform_(self.cross_projector.weight, gain=0.1)
+        nn.init.zeros_(self.cross_projector.bias)
         nn.init.zeros_(self.gate_projector.weight)
         nn.init.constant_(self.gate_projector.bias, -2.0)
 
@@ -280,55 +231,11 @@ class CPTA_iTransformer(nn.Module):
         allowed = channel_ids[:, None].ne(channel_ids[None, :])
         return ~allowed
 
-    def _generate_self_future_tokens(self, history_groups):
-        future_groups = []
-        attns = []
-        for channel_idx, (period, history) in enumerate(zip(
-                self.channel_periods, history_groups)):
-            identity = self.period_embedding.channel_embedding.weight[
-                channel_idx
-            ].view(1, 1, self.d_model)
-            queries = self.self_future_queries[str(period)].expand(
-                history.shape[0], -1, -1
-            ) + identity
-            future, attn = self.self_future_generator(queries, history)
-            future_groups.append(future)
-            attns.append(attn)
-        return future_groups, attns
-
-    def _generate_cross_future_tokens(self, history_groups):
-        future_groups = []
-        attns = []
-        for channel_idx, history in enumerate(history_groups):
-            identity = self.cross_period_embedding.channel_embedding.weight[
-                channel_idx
-            ].view(1, 1, self.d_model)
-            queries = self.cross_future_query.expand(
-                history.shape[0], -1, -1
-            ) + identity
-            future, attn = self.cross_future_generator(queries, history)
-            future_groups.append(future)
-            attns.append(attn)
-        return future_groups, attns
-
-    def _decode_self_future(self, future_groups):
+    def _project_token_groups(self, token_groups, projector):
         predictions = []
-        for period, tokens in zip(self.channel_periods, future_groups):
-            patches = self.self_patch_decoders[str(period)](
-                self.head_dropout(tokens)
-            )
-            predictions.append(
-                patches.flatten(start_dim=1)[:, :self.pred_len]
-            )
-        return torch.stack(predictions, dim=-1)
-
-    def _decode_cross_future(self, future_groups):
-        predictions = []
-        for tokens in future_groups:
-            patches = self.cross_patch_decoder(self.head_dropout(tokens))
-            predictions.append(
-                patches.flatten(start_dim=1)[:, :self.pred_len]
-            )
+        for tokens in token_groups:
+            token_predictions = projector(self.head_dropout(tokens))
+            predictions.append(token_predictions.mean(dim=1))
         return torch.stack(predictions, dim=-1)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
@@ -348,10 +255,9 @@ class CPTA_iTransformer(nn.Module):
         self_patch_tokens = self.period_embedding.split_patch_tokens(
             intra_out, num_patches_list
         )
-        self_future_tokens, self_future_attns = (
-            self._generate_self_future_tokens(self_patch_tokens)
+        self_pred = self._project_token_groups(
+            self_patch_tokens, self.self_projector
         )
-        self_pred = self._decode_self_future(self_future_tokens)
 
         if self.n_vars > 1:
             cross_input, cross_num_patches_list = (
@@ -375,19 +281,14 @@ class CPTA_iTransformer(nn.Module):
                     cross_out, cross_num_patches_list
                 )
             )
-            cross_future_tokens, cross_future_attns = (
-                self._generate_cross_future_tokens(cross_patch_tokens)
+            delta = self._project_token_groups(
+                cross_patch_tokens, self.cross_projector
             )
-            # Decoded cross patches can exceed pred_len when it is not a
-            # multiple of cross_period. _decode_cross_future truncates first,
-            # so only an exact-length correction is added to self_pred.
-            delta = self._decode_cross_future(cross_future_tokens)
             gate_input = torch.stack([self_pred, delta], dim=-1)
             gate = torch.sigmoid(self.gate_projector(gate_input).squeeze(-1))
             dec_out = self_pred + gate * delta
         else:
             cross_attns = []
-            cross_future_attns = []
             cross_num_patches_list = []
             gate = torch.zeros_like(self_pred)
             dec_out = self_pred
@@ -398,9 +299,7 @@ class CPTA_iTransformer(nn.Module):
 
         attns = {
             'intra_variate': intra_attns,
-            'self_to_future': self_future_attns,
             'cross_variate': cross_attns,
-            'cross_to_future': cross_future_attns,
             'periods': list(self.channel_periods),
             'num_patches': list(num_patches_list),
             'cross_period': self.cross_period,

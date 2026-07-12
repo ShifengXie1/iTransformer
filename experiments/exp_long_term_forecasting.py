@@ -88,7 +88,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
             os.makedirs(path)
-        if self.args.model == 'iTransformer_fft':
+        if self.args.model in ('iTransformer_fft', 'iTransformer_cross'):
             save_period_metadata(
                 os.path.join(path, 'channel_periods.json'),
                 self.args.channel_periods,
@@ -279,13 +279,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         f.write('[{}] {}  \n'.format(run_timestamp, setting))
         f.write('mse:{}, mae:{}'.format(mse, mae))
         f.write('\n')
-        if self.args.model == 'iTransformer_fft':
+        if self.args.model in ('iTransformer_fft', 'iTransformer_cross'):
             f.write('fft_periods_by_variable:{}\n'.format(
                 self.args.channel_periods
             ))
-            f.write('cross_period_mode:{}\n'.format(
-                self.args.cross_period
-            ))
+            if self.args.model == 'iTransformer_fft':
+                f.write('cross_period_mode:{}\n'.format(
+                    self.args.cross_period
+                ))
+            else:
+                f.write('cross_top_k:{}\n'.format(
+                    self.args.cross_top_k
+                ))
         f.write('\n')
         f.close()
 

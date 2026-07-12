@@ -26,7 +26,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options: [iTransformer, iTransformer_fft, iInformer, iReformer, iFlowformer, iFlashformer]')
+                        help='model name, options: [iTransformer, iTransformer_fft, iTransformer_cross, iInformer, iReformer, iFlowformer, iFlashformer]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -91,6 +91,10 @@ if __name__ == '__main__':
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
+    parser.add_argument('--cross_top_k', type=int, default=3,
+                        help='dynamic source variates selected per target in iTransformer_cross')
+    parser.add_argument('--router_temperature', type=float, default=1.0,
+                        help='temperature for sparse routing weights in iTransformer_cross')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
@@ -110,7 +114,7 @@ if __name__ == '__main__':
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
 
-    if args.model == 'iTransformer_fft':
+    if args.model in ('iTransformer_fft', 'iTransformer_cross'):
         period_cache_name = '{}_{}_sl{}_c{}.json'.format(
             os.path.splitext(os.path.basename(args.data_path))[0],
             args.features,
@@ -155,13 +159,14 @@ if __name__ == '__main__':
                 'Estimated channel periods must contain exactly enc_in values: '
                 f'expected {args.enc_in}, got {len(args.channel_periods)}'
             )
-        period_counts = Counter(args.channel_periods)
-        max_period_count = max(period_counts.values())
-        args.cross_period = min(
-            period for period, count in period_counts.items()
-            if count == max_period_count
-        )
-        print('Cross-variate mode period:', args.cross_period)
+        if args.model == 'iTransformer_fft':
+            period_counts = Counter(args.channel_periods)
+            max_period_count = max(period_counts.values())
+            args.cross_period = min(
+                period for period, count in period_counts.items()
+                if count == max_period_count
+            )
+            print('Cross-variate mode period:', args.cross_period)
         if args.channel_period_confidence is not None:
             print('Period confidence:', args.channel_period_confidence)
 
@@ -196,9 +201,15 @@ if __name__ == '__main__':
                 args.des,
                 args.class_strategy, ii)
             if args.model == 'iTransformer_fft':
-                setting += '_cp{}_xp{}'.format(
+                setting += '_cp{}_xp{}_linearhead'.format(
                     '-'.join(map(str, args.channel_periods)),
                     args.cross_period,
+                )
+            elif args.model == 'iTransformer_cross':
+                setting += '_cp{}_k{}_rt{}'.format(
+                    '-'.join(map(str, args.channel_periods)),
+                    args.cross_top_k,
+                    args.router_temperature,
                 )
 
             exp = Exp(args)  # set experiments
@@ -234,9 +245,15 @@ if __name__ == '__main__':
             args.des,
             args.class_strategy, ii)
         if args.model == 'iTransformer_fft':
-            setting += '_cp{}_xp{}'.format(
+            setting += '_cp{}_xp{}_linearhead'.format(
                 '-'.join(map(str, args.channel_periods)),
                 args.cross_period,
+            )
+        elif args.model == 'iTransformer_cross':
+            setting += '_cp{}_k{}_rt{}'.format(
+                '-'.join(map(str, args.channel_periods)),
+                args.cross_top_k,
+                args.router_temperature,
             )
 
         exp = Exp(args)  # set experiments
