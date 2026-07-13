@@ -37,6 +37,15 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
+    def _add_model_auxiliary_loss(self, loss, target):
+        """Use optional model-owned objectives without affecting baselines."""
+        model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        auxiliary_loss = getattr(model, 'auxiliary_loss', None)
+        if auxiliary_loss is None:
+            return loss
+        auxiliary = auxiliary_loss(target)
+        return loss + auxiliary.get('total', loss.new_zeros(()))
+
     def vali(self, vali_data, vali_loader, criterion):
         total_loss = []
         self.model.eval()
@@ -144,6 +153,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
+                        loss = self._add_model_auxiliary_loss(loss, batch_y)
                         train_loss.append(loss.item())
                 else:
                     if self.args.output_attention:
@@ -155,6 +165,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
+                    loss = self._add_model_auxiliary_loss(loss, batch_y)
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:

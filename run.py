@@ -26,7 +26,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options: [iTransformer, iTransformer_fft, iTransformer_cross, iInformer, iReformer, iFlowformer, iFlashformer]')
+                        help='model name, options: [iTransformer, iTransformer_fft, iTransformer_cross, iTransformer_decom, iInformer, iReformer, iFlowformer, iFlashformer]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -95,6 +95,32 @@ if __name__ == '__main__':
                         help='dynamic source variates selected per target in iTransformer_cross')
     parser.add_argument('--router_temperature', type=float, default=1.0,
                         help='temperature for sparse routing weights in iTransformer_cross')
+    parser.add_argument('--decomp_kernels', type=str, default='3,7,15,31',
+                        help='comma-separated causal smoothing kernels')
+    parser.add_argument('--decomp_lags', type=str, default='0,1,2,4,8',
+                        help='comma-separated cross-component source lags')
+    parser.add_argument('--decomp_hidden', type=int, default=128,
+                        help='hidden size of the no-patch decomposition model')
+    parser.add_argument('--decomp_tcn_layers', type=int, default=2,
+                        help='causal TCN layers for the fluctuation component')
+    parser.add_argument('--decomp_top_k', type=int, default=3,
+                        help='selected variable-component-lag sources per target component')
+    parser.add_argument('--decomp_variate_top_k', type=int, default=8,
+                        help='candidate variables retained before component-lag routing')
+    parser.add_argument('--decomp_router_temperature', type=float, default=1.0,
+                        help='temperature for decomposition-aware sparse routing')
+    parser.add_argument('--decomp_self_loss', type=float, default=0.1,
+                        help='weight of the channel-independent self forecast loss')
+    parser.add_argument('--decomp_utility_loss', type=float, default=0.05,
+                        help='weight of leave-one-source-out routing utility loss')
+    parser.add_argument('--decomp_safe_loss', type=float, default=0.05,
+                        help='weight of the negative-transfer safety loss')
+    parser.add_argument('--decomp_smooth_loss', type=float, default=0.001,
+                        help='weight of causal trend smoothness regularization')
+    parser.add_argument('--decomp_orth_loss', type=float, default=0.001,
+                        help='weight of trend-fluctuation orthogonality')
+    parser.add_argument('--decomp_entropy_loss', type=float, default=0.001,
+                        help='weight of sparse router entropy regularization')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
@@ -211,6 +237,14 @@ if __name__ == '__main__':
                     args.cross_top_k,
                     args.router_temperature,
                 )
+            elif args.model == 'iTransformer_decom':
+                setting += '_dk{}_lag{}_vk{}_k{}_rt{}'.format(
+                    args.decomp_kernels.replace(',', '-'),
+                    args.decomp_lags.replace(',', '-'),
+                    args.decomp_variate_top_k,
+                    args.decomp_top_k,
+                    args.decomp_router_temperature,
+                )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -254,6 +288,14 @@ if __name__ == '__main__':
                 '-'.join(map(str, args.channel_periods)),
                 args.cross_top_k,
                 args.router_temperature,
+            )
+        elif args.model == 'iTransformer_decom':
+            setting += '_dk{}_lag{}_vk{}_k{}_rt{}'.format(
+                args.decomp_kernels.replace(',', '-'),
+                args.decomp_lags.replace(',', '-'),
+                args.decomp_variate_top_k,
+                args.decomp_top_k,
+                args.decomp_router_temperature,
             )
 
         exp = Exp(args)  # set experiments
