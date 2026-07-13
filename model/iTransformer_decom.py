@@ -1,9 +1,10 @@
 """Decomposition-aware, utility-routed multivariate forecasting.
 
-The model deliberately avoids both FFT period discovery and temporal patches.
-It first builds a strict channel-independent forecast from a causal trend and a
-fluctuation component.  Cross-variate information is then used only as a
-sparse, gated residual correction.
+The model performs a single DFT decomposition on the original input history and
+does not construct temporal patches or a multi-scale input pyramid.  A strong
+trend predictor forms the channel-independent baseline, a small gated
+fluctuation branch completes the self forecast, and cross-variate information
+is used only as a sparse, gated residual correction.
 """
 
 import math
@@ -26,71 +27,44 @@ def _parse_int_list(value, default: Iterable[int]) -> List[int]:
     return values
 
 
-class CausalMovingAverage(nn.Module):
-    """Left-looking moving average with length-preserving boundary padding."""
+class DFTSeriesDecomposition(nn.Module):
+    """Split each original input series into dominant-frequency and trend parts.
 
-    def __init__(self, kernel_size: int):
-        super().__init__()
-        if kernel_size < 1:
-            raise ValueError('moving-average kernel must be positive')
-        self.kernel_size = int(kernel_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, L]. Replication avoids an artificial zero-valued warm-up.
-        if self.kernel_size == 1:
-            return x
-        padded = F.pad(
-            x, (self.kernel_size - 1, 0), mode='replicate'
-        )
-        return F.avg_pool1d(
-            padded, kernel_size=self.kernel_size, stride=1
-        )
-
-
-class AdaptiveCausalDecomposition(nn.Module):
-    """Input-dependent mixture of causal smoothers.
-
-    We decompose into trend and fluctuation rather than claiming that the
-    remainder is a pure seasonal component without an explicit periodicity
-    assumption.
+    This is the single-scale DFT decomposition used by TimeMixer, with the FFT
+    explicitly applied along the temporal dimension.  The DC component remains
+    in the trend, while the strongest non-DC frequencies form the fluctuation.
     """
 
-    def __init__(self, kernels: Iterable[int], hidden: int, dropout: float):
+    def __init__(self, top_k: int):
         super().__init__()
-        self.kernels = [int(kernel) for kernel in kernels]
-        self.smoothers = nn.ModuleList([
-            CausalMovingAverage(kernel) for kernel in self.kernels
-        ])
-        router_hidden = max(8, min(hidden, 64))
-        self.scale_router = nn.Sequential(
-            nn.Linear(4, router_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(router_hidden, len(self.kernels)),
-        )
+        self.top_k = int(top_k)
+        if self.top_k < 1:
+            raise ValueError('decomp_dft_top_k must be at least 1')
 
     def forward(
             self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Statistics are computed independently for every sample and variate.
-        mean = x.mean(dim=-1)
-        std = x.std(dim=-1, unbiased=False)
-        slope = x[..., -1] - x[..., 0]
-        if x.shape[-1] > 1:
-            variation = (x[..., 1:] - x[..., :-1]).abs().mean(dim=-1)
-        else:
-            variation = torch.zeros_like(mean)
-        descriptors = torch.stack([mean, std, slope, variation], dim=-1)
-        scale_weights = torch.softmax(self.scale_router(descriptors), dim=-1)
+        # x: [B, C, L]. Decomposition is independent per sample and variate.
+        spectrum = torch.fft.rfft(x, dim=-1)
+        amplitudes = spectrum.abs()
+        frequency_mask = torch.zeros_like(amplitudes, dtype=torch.bool)
 
-        candidates = torch.stack(
-            [smoother(x) for smoother in self.smoothers], dim=-2
-        )  # [B, C, M, L]
-        trend = (
-            candidates * scale_weights.unsqueeze(-1)
-        ).sum(dim=-2)
-        fluctuation = x - trend
-        return trend, fluctuation, scale_weights
+        # Bin 0 is the DC component and is assigned to the trend.  Clamp top-k
+        # for very short input histories that have fewer available frequencies.
+        non_dc_bins = amplitudes.shape[-1] - 1
+        selected_k = min(self.top_k, non_dc_bins)
+        if selected_k > 0:
+            selected = torch.topk(
+                amplitudes[..., 1:], k=selected_k, dim=-1
+            ).indices + 1
+            frequency_mask.scatter_(-1, selected, True)
+
+        seasonal_spectrum = spectrum * frequency_mask.to(spectrum.dtype)
+        fluctuation = torch.fft.irfft(
+            seasonal_spectrum, n=x.shape[-1], dim=-1
+        )
+        trend = x - fluctuation
+        return trend, fluctuation, frequency_mask
 
 
 class CausalDepthwiseBlock(nn.Module):
@@ -115,6 +89,39 @@ class CausalDepthwiseBlock(nn.Module):
         y = value * torch.sigmoid(gate)
         y = self.pointwise_out(self.dropout(y))
         return self.norm(residual + self.dropout(y))
+
+
+class TrendSelfPredictor(nn.Module):
+    """Strong channel-independent baseline driven by the decomposed trend."""
+
+    def __init__(
+            self, seq_len: int, pred_len: int, hidden: int, dropout: float
+    ):
+        super().__init__()
+        # The direct temporal map is deliberately the main path.  A small
+        # nonlinear residual head improves regime adaptation without replacing
+        # the stable linear extrapolation bias that works well for trends.
+        self.direct_head = nn.Linear(seq_len, pred_len)
+        self.token_encoder = nn.Sequential(
+            nn.LayerNorm(seq_len),
+            nn.Linear(seq_len, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+        )
+        self.residual_head = nn.Linear(hidden, pred_len)
+        nn.init.xavier_uniform_(self.residual_head.weight, gain=0.1)
+        nn.init.zeros_(self.residual_head.bias)
+
+    def forward(
+            self, trend: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # trend: [B, C, L]. The same weights are shared across all variates.
+        token = self.token_encoder(trend)
+        prediction = self.direct_head(trend) + self.residual_head(token)
+        return token, prediction
 
 
 class FluctuationEncoder(nn.Module):
@@ -362,7 +369,7 @@ class CrossMessageRefiner(nn.Module):
 
 
 class Model(nn.Module):
-    """Causal decomposition and utility-routed residual fusion model."""
+    """Single-scale DFT decomposition and utility-routed residual fusion."""
 
     def __init__(self, configs):
         super().__init__()
@@ -374,9 +381,6 @@ class Model(nn.Module):
             configs, 'decomp_hidden', min(int(configs.d_model), 128)
         ))
 
-        kernels = _parse_int_list(
-            getattr(configs, 'decomp_kernels', None), (3, 7, 15, 31)
-        )
         lags = _parse_int_list(
             getattr(configs, 'decomp_lags', None), (0, 1, 2, 4, 8)
         )
@@ -386,21 +390,29 @@ class Model(nn.Module):
                 f'max lag {max(lags)}, seq_len {self.seq_len}'
             )
         self.lags = lags
-        self.decomposition = AdaptiveCausalDecomposition(
-            kernels, self.hidden, configs.dropout
+        self.decomposition = DFTSeriesDecomposition(
+            getattr(configs, 'decomp_dft_top_k', 5)
         )
 
-        self.trend_encoder = nn.Sequential(
-            nn.Linear(self.seq_len, self.hidden),
-            nn.GELU(),
-            nn.Dropout(configs.dropout),
-            nn.LayerNorm(self.hidden),
+        self.trend_predictor = TrendSelfPredictor(
+            self.seq_len, self.pred_len, self.hidden, configs.dropout
         )
-        self.trend_head = nn.Linear(self.seq_len, self.pred_len)
         self.fluctuation_encoder = FluctuationEncoder(
             self.seq_len, self.pred_len, self.hidden,
             getattr(configs, 'decomp_tcn_layers', configs.e_layers),
             configs.dropout,
+        )
+        self.self_fluctuation_gate = nn.Sequential(
+            nn.LayerNorm(self.hidden * 2),
+            nn.Linear(self.hidden * 2, self.pred_len),
+        )
+        self.fluctuation_gate_bias = float(getattr(
+            configs, 'decomp_fluctuation_gate_bias', -2.0
+        ))
+        nn.init.zeros_(self.self_fluctuation_gate[-1].weight)
+        nn.init.constant_(
+            self.self_fluctuation_gate[-1].bias,
+            self.fluctuation_gate_bias,
         )
 
         # Whole-history lag projections: no temporal patch construction.
@@ -423,22 +435,27 @@ class Model(nn.Module):
             nn.Linear(self.hidden, self.pred_len) for _ in range(2)
         ])
         self.gate_heads = nn.ModuleList([
-            nn.Linear(self.hidden * 2, self.pred_len) for _ in range(2)
+            nn.Linear(self.hidden * 3, self.pred_len) for _ in range(2)
         ])
+        self.cross_gate_bias = float(getattr(
+            configs, 'decomp_cross_gate_bias', -2.5
+        ))
 
         for head in self.delta_heads:
             nn.init.xavier_uniform_(head.weight, gain=0.1)
             nn.init.zeros_(head.bias)
         for head in self.gate_heads:
             nn.init.zeros_(head.weight)
-            nn.init.constant_(head.bias, -2.0)
+            nn.init.constant_(head.bias, self.cross_gate_bias)
 
         self.aux_weights = {
+            'trend': float(getattr(configs, 'decomp_trend_loss', 0.2)),
+            'fluctuation': float(getattr(
+                configs, 'decomp_fluctuation_loss', 0.05
+            )),
             'self': float(getattr(configs, 'decomp_self_loss', 0.1)),
             'utility': float(getattr(configs, 'decomp_utility_loss', 0.05)),
             'safe': float(getattr(configs, 'decomp_safe_loss', 0.05)),
-            'smooth': float(getattr(configs, 'decomp_smooth_loss', 1e-3)),
-            'orth': float(getattr(configs, 'decomp_orth_loss', 1e-3)),
             'entropy': float(getattr(configs, 'decomp_entropy_loss', 1e-3)),
         }
         self._aux_state: Optional[Dict[str, torch.Tensor]] = None
@@ -473,11 +490,14 @@ class Model(nn.Module):
         deltas = []
         gates = []
         contributions = []
+        # Each correction gate sees the complete target self state (trend and
+        # fluctuation) before deciding whether an external message is useful.
+        self_context = self_tokens.flatten(start_dim=2)
         for component in range(2):
             message = messages[:, :, component, :]
             delta = self.delta_heads[component](message)
             gate_input = torch.cat([
-                self_tokens[:, :, component, :], message
+                self_context, message
             ], dim=-1)
             gate = torch.sigmoid(self.gate_heads[component](gate_input))
             deltas.append(delta)
@@ -499,6 +519,15 @@ class Model(nn.Module):
         extra_dims = prediction.ndim - 3
         shape = [means.shape[0], means.shape[1]] + [1] * (extra_dims + 1)
         return prediction * stdev.reshape(shape) + means.reshape(shape)
+
+    @staticmethod
+    def _rescale_residual(
+            residual: torch.Tensor, stdev: torch.Tensor
+    ) -> torch.Tensor:
+        # Residual corrections are scaled back without adding the series mean.
+        extra_dims = residual.ndim - 3
+        shape = [stdev.shape[0], stdev.shape[1]] + [1] * (extra_dims + 1)
+        return residual * stdev.reshape(shape)
 
     def forecast(
             self, x_enc: torch.Tensor, x_mark_enc=None,
@@ -525,18 +554,23 @@ class Model(nn.Module):
         # All component encoders operate on [B, C, L] and share their weights
         # across C, preserving strict channel independence in the self path.
         x_channel_first = x.transpose(1, 2)
-        trend, fluctuation, scale_weights = self.decomposition(
+        trend, fluctuation, frequency_mask = self.decomposition(
             x_channel_first
         )
-        trend_token = self.trend_encoder(trend)
-        trend_prediction = self.trend_head(trend)
+        trend_token, trend_prediction = self.trend_predictor(trend)
         fluctuation_token, fluctuation_prediction = (
             self.fluctuation_encoder(fluctuation)
         )
         self_tokens = torch.stack(
             [trend_token, fluctuation_token], dim=2
         )
-        self_prediction = trend_prediction + fluctuation_prediction
+        self_fluctuation_gate = torch.sigmoid(self.self_fluctuation_gate(
+            torch.cat([trend_token, fluctuation_token], dim=-1)
+        ))
+        fluctuation_contribution = (
+            self_fluctuation_gate * fluctuation_prediction
+        )
+        self_prediction = trend_prediction + fluctuation_contribution
 
         if x.shape[2] > 1:
             source_tokens = self._lag_tokens(trend, fluctuation)
@@ -548,7 +582,8 @@ class Model(nn.Module):
             deltas, gates, contributions = self._component_corrections(
                 self_tokens, messages
             )
-            prediction = self_prediction + contributions.sum(dim=2)
+            cross_correction = contributions.sum(dim=2)
+            prediction = self_prediction + cross_correction
         else:
             routed = self.router(
                 self_tokens,
@@ -560,6 +595,7 @@ class Model(nn.Module):
             )
             gates = torch.zeros_like(deltas)
             contributions = torch.zeros_like(deltas)
+            cross_correction = torch.zeros_like(self_prediction)
             prediction = self_prediction
 
         final_output = self._denormalize(
@@ -568,18 +604,19 @@ class Model(nn.Module):
         self_output = self._denormalize(
             self_prediction, means, stdev
         ).transpose(1, 2)
+        trend_output = self._denormalize(
+            trend_prediction, means, stdev
+        ).transpose(1, 2)
+        fluctuation_self_output = self._rescale_residual(
+            fluctuation_contribution, stdev
+        ).transpose(1, 2)
+        fluctuation_candidate_output = self._rescale_residual(
+            fluctuation_prediction, stdev
+        ).transpose(1, 2)
+        cross_correction_output = self._rescale_residual(
+            cross_correction, stdev
+        ).transpose(1, 2)
 
-        if trend.shape[-1] > 2:
-            smooth_loss = (
-                trend[..., 2:] - 2 * trend[..., 1:-1] + trend[..., :-2]
-            ).abs().mean()
-        else:
-            smooth_loss = trend.new_zeros(())
-        trend_flat = trend.flatten(0, 1)
-        fluctuation_flat = fluctuation.flatten(0, 1)
-        orth_loss = F.cosine_similarity(
-            trend_flat, fluctuation_flat, dim=-1, eps=1e-6
-        ).abs().mean()
         if routed['weights'].numel():
             entropy_loss = -(
                 routed['weights'] * torch.log(routed['weights'] + 1e-8)
@@ -592,6 +629,9 @@ class Model(nn.Module):
         self._aux_state = {
             'final': final_output,
             'self': self_output,
+            'trend': trend_output,
+            'self_fluctuation': fluctuation_self_output,
+            'cross_correction': cross_correction_output,
             'self_normalized': self_prediction,
             'self_tokens': self_tokens,
             'full_contributions': contributions,
@@ -599,15 +639,17 @@ class Model(nn.Module):
             'routed_weights': routed['weights'],
             'means': means,
             'stdev': stdev,
-            'smooth': smooth_loss,
-            'orth': orth_loss,
             'entropy': entropy_loss,
         } if self.training else None
 
         diagnostics = {
             'trend': trend,
             'fluctuation': fluctuation,
-            'decomposition_weights': scale_weights,
+            'decomposition_mask': frequency_mask,
+            'trend_prediction': trend_output,
+            'fluctuation_candidate': fluctuation_candidate_output,
+            'fluctuation_self_correction': fluctuation_self_output,
+            'self_fluctuation_gate': self_fluctuation_gate,
             'self_prediction': self_output,
             'selected_sources': routed['source_variates'],
             'selected_components': routed['source_components'],
@@ -617,17 +659,20 @@ class Model(nn.Module):
             'variable_route_scores': routed.get('variable_scores'),
             'cross_messages': messages,
             'cross_deltas': deltas,
+            'cross_fusion_gates': gates,
             'fusion_gates': gates,
+            'cross_correction': cross_correction_output,
         }
         return final_output, diagnostics
 
     def auxiliary_loss(self, target: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Return train-time self, safety, utility and structure losses.
+        """Return component, self, safety, utility and routing losses.
 
         ``target`` must already be restricted to the prediction horizon.  For
         an MS task, the final target channel is aligned with the final model
-        channel.  Leave-one-routed-source-out predictions supervise routing by
-        marginal forecasting utility rather than representation similarity.
+        channel.  Trend and fluctuation targets use the same single-scale DFT
+        split as the input.  Leave-one-routed-source-out predictions supervise
+        routing by marginal forecasting utility rather than similarity.
         """
         state = self._aux_state
         if state is None:
@@ -641,10 +686,38 @@ class Model(nn.Module):
         channel_slice = slice(model_channels - target_channels, model_channels)
         final = state['final'][..., channel_slice]
         self_output = state['self'][..., channel_slice]
+        trend_output = state['trend'][..., channel_slice]
+        fluctuation_output = state['self_fluctuation'][..., channel_slice]
+        cross_correction = state['cross_correction'][..., channel_slice]
         target = target[..., -target_channels:]
 
+        means = state['means'][:, channel_slice]
+        stdev = state['stdev'][:, channel_slice]
+        target_channel_first = target.transpose(1, 2)
+        target_normalized = (
+            target_channel_first - means.unsqueeze(-1)
+        ) / stdev.unsqueeze(-1)
+        target_trend_normalized, target_fluctuation_normalized, _ = (
+            self.decomposition(target_normalized)
+        )
+        target_trend = (
+            target_trend_normalized * stdev.unsqueeze(-1)
+            + means.unsqueeze(-1)
+        ).transpose(1, 2)
+        target_fluctuation = (
+            target_fluctuation_normalized * stdev.unsqueeze(-1)
+        ).transpose(1, 2)
+
+        trend_loss = F.mse_loss(trend_output, target_trend)
+        fluctuation_loss = F.mse_loss(
+            fluctuation_output, target_fluctuation
+        )
         self_loss = F.mse_loss(self_output, target)
-        final_error = (final - target).pow(2)
+        # Stop the safety objective at the self baseline.  It therefore teaches
+        # only the cross-variate path to help rather than perturbing the strong
+        # channel-independent predictor when a correction is harmful.
+        safe_prediction = self_output.detach() + cross_correction
+        final_error = (safe_prediction - target).pow(2)
         self_error = (self_output.detach() - target).pow(2)
         safe_loss = F.relu(final_error - self_error).mean()
         utility_loss = target.new_zeros(())
@@ -674,15 +747,15 @@ class Model(nn.Module):
             )
 
             loo_contributions = []
+            self_context = state['self_tokens'].flatten(start_dim=2)
+            self_context = self_context.unsqueeze(2).expand(
+                -1, -1, selected_k, -1
+            )
             for component in range(2):
                 message = leave_one_out_messages[:, :, component, :, :]
                 delta = self.delta_heads[component](message)
-                token = state['self_tokens'][:, :, component, :]
-                token = token.unsqueeze(2).expand(
-                    -1, -1, selected_k, -1
-                )
                 gate = torch.sigmoid(self.gate_heads[component](
-                    torch.cat([token, message], dim=-1)
+                    torch.cat([self_context, message], dim=-1)
                 ))
                 loo_contributions.append(gate * delta)
             loo_contributions = torch.stack(
@@ -718,11 +791,11 @@ class Model(nn.Module):
                 utility_loss = cross_entropy[valid].mean()
 
         losses = {
+            'trend': trend_loss,
+            'fluctuation': fluctuation_loss,
             'self': self_loss,
             'utility': utility_loss,
             'safe': safe_loss,
-            'smooth': state['smooth'],
-            'orth': state['orth'],
             'entropy': state['entropy'],
         }
         total = sum(
