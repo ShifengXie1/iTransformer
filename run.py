@@ -94,16 +94,22 @@ if __name__ == '__main__':
                         help='dynamic source variates selected per target in iTransformer_cross')
     parser.add_argument('--router_temperature', type=float, default=1.0,
                         help='temperature for sparse routing weights in iTransformer_cross')
-    parser.add_argument('--decomp_dft_top_k', type=int, default=5,
-                        help='dominant non-DC frequencies retained by iTransformer_decom')
+    parser.add_argument('--decomp_moving_avg', type=int, default=25,
+                        help='centered moving-average window used by the TimeMixer backbone')
     parser.add_argument('--decomp_lags', type=str, default='0,1,2,4,8',
-                        help='comma-separated cross-component source lags')
-    parser.add_argument('--decomp_hidden', type=int, default=128,
-                        help='hidden size of the no-patch decomposition model')
-    parser.add_argument('--decomp_tcn_layers', type=int, default=2,
-                        help='causal TCN layers for the fluctuation component')
-    parser.add_argument('--decomp_fluctuation_gate_bias', type=float, default=-2.0,
-                        help='initial logit bias for fluctuation correction in self prediction')
+                        help='comma-separated scale-local cross-component source lags')
+    parser.add_argument('--decomp_hidden', type=int, default=16,
+                        help='hidden size of the channel-independent TimeMixer backbone')
+    parser.add_argument('--decomp_d_ff', type=int, default=32,
+                        help='feed-forward size inside each TimeMixer PDM block')
+    parser.add_argument('--decomp_mixing_layers', type=int, default=2,
+                        help='number of multi-scale PDM blocks')
+    parser.add_argument('--decomp_down_sampling_layers', type=int, default=3,
+                        help='number of TimeMixer downsampling stages')
+    parser.add_argument('--decomp_down_sampling_window', type=int, default=2,
+                        help='downsampling factor between adjacent TimeMixer scales')
+    parser.add_argument('--decomp_down_sampling_method', type=str, default='avg',
+                        choices=['avg', 'max'], help='channel-independent downsampling method')
     parser.add_argument('--decomp_top_k', type=int, default=3,
                         help='selected variable-component-lag sources per target component')
     parser.add_argument('--decomp_variate_top_k', type=int, default=8,
@@ -112,10 +118,6 @@ if __name__ == '__main__':
                         help='temperature for decomposition-aware sparse routing')
     parser.add_argument('--decomp_cross_gate_bias', type=float, default=-2.5,
                         help='initial logit bias for cross-variate residual correction')
-    parser.add_argument('--decomp_trend_loss', type=float, default=0.2,
-                        help='weight of decomposed trend forecast supervision')
-    parser.add_argument('--decomp_fluctuation_loss', type=float, default=0.05,
-                        help='weight of gated fluctuation forecast supervision')
     parser.add_argument('--decomp_self_loss', type=float, default=0.1,
                         help='weight of the channel-independent self forecast loss')
     parser.add_argument('--decomp_utility_loss', type=float, default=0.05,
@@ -241,8 +243,11 @@ if __name__ == '__main__':
                     args.router_temperature,
                 )
             elif args.model == 'iTransformer_decom':
-                setting += '_dfk{}_lag{}_vk{}_k{}_rt{}'.format(
-                    args.decomp_dft_top_k,
+                setting += '_ma{}_ds{}w{}{}_lag{}_vk{}_k{}_rt{}'.format(
+                    args.decomp_moving_avg,
+                    args.decomp_down_sampling_layers,
+                    args.decomp_down_sampling_window,
+                    args.decomp_down_sampling_method,
                     args.decomp_lags.replace(',', '-'),
                     args.decomp_variate_top_k,
                     args.decomp_top_k,
@@ -293,8 +298,11 @@ if __name__ == '__main__':
                 args.router_temperature,
             )
         elif args.model == 'iTransformer_decom':
-            setting += '_dfk{}_lag{}_vk{}_k{}_rt{}'.format(
-                args.decomp_dft_top_k,
+            setting += '_ma{}_ds{}w{}{}_lag{}_vk{}_k{}_rt{}'.format(
+                args.decomp_moving_avg,
+                args.decomp_down_sampling_layers,
+                args.decomp_down_sampling_window,
+                args.decomp_down_sampling_method,
                 args.decomp_lags.replace(',', '-'),
                 args.decomp_variate_top_k,
                 args.decomp_top_k,
