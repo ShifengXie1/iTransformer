@@ -4,7 +4,6 @@ from datetime import datetime
 import os
 import torch
 from experiments.exp_long_term_forecasting import Exp_Long_Term_Forecast
-from experiments.exp_long_term_forecasting_partial import Exp_Long_Term_Forecast_Partial
 from data_provider.data_factory import data_provider
 from utils.periods import (
     estimate_channel_periods,
