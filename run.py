@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options: [iTransformer, iTransformer_fft, iTransformer_cross, iTransformer_decom, iInformer, iReformer, iFlowformer, iFlashformer]')
+                        help='model name, options include: [iTransformer, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -88,6 +88,32 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # iTransformer multi-token-head variants
+    parser.add_argument('--num_token_heads', type=int, default=4,
+                        help='number of independent dynamic token branches')
+    parser.add_argument('--use_dynamic_mask', type=int, choices=[0, 1], default=1,
+                        help='use input-conditioned temporal masks: 1 enables, 0 disables')
+    parser.add_argument('--token_mask_hidden', type=int, default=64,
+                        help='hidden width of every temporal mask generator')
+    parser.add_argument('--token_temperature', type=float, default=1.0,
+                        help='softmax temperature used by temporal masks')
+    parser.add_argument('--gate_temperature', type=float, default=1.0,
+                        help='softmax temperature used by branch fusion')
+    parser.add_argument('--fusion_type', type=str, default='dynamic',
+                        choices=['mean', 'learnable_global', 'dynamic'],
+                        help='branch prediction fusion strategy')
+    parser.add_argument('--share_prediction_head', type=int, choices=[0, 1], default=0,
+                        help='share one prediction head: 1 shares, 0 uses independent heads')
+    parser.add_argument('--lambda_branch', type=float, default=0.2,
+                        help='weight of the mean per-branch forecast loss')
+    parser.add_argument('--lambda_redundancy', type=float, default=1e-3,
+                        help='weight of cross-branch representation correlation')
+    parser.add_argument('--lambda_contribution', type=float, default=0.05,
+                        help='weight of leave-one-branch-out contribution loss')
+    parser.add_argument('--lambda_balance', type=float, default=0.01,
+                        help='weight of the gate-to-uniform balance loss')
+    parser.add_argument('--contribution_margin', type=float, default=1e-4,
+                        help='required error increase after removing a branch')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
     parser.add_argument('--cross_top_k', type=int, default=3,
@@ -253,6 +279,13 @@ if __name__ == '__main__':
                     args.decomp_top_k,
                     args.decomp_router_temperature,
                 )
+            elif args.model == 'iTransformer_multihead':
+                setting += '_th{}_mask{}_fusion{}_share{}'.format(
+                    args.num_token_heads,
+                    int(args.use_dynamic_mask),
+                    args.fusion_type,
+                    int(args.share_prediction_head),
+                )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -307,6 +340,13 @@ if __name__ == '__main__':
                 args.decomp_variate_top_k,
                 args.decomp_top_k,
                 args.decomp_router_temperature,
+            )
+        elif args.model == 'iTransformer_multihead':
+            setting += '_th{}_mask{}_fusion{}_share{}'.format(
+                args.num_token_heads,
+                int(args.use_dynamic_mask),
+                args.fusion_type,
+                int(args.share_prediction_head),
             )
 
         exp = Exp(args)  # set experiments

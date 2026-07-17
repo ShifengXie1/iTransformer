@@ -2,7 +2,8 @@ import os
 import torch
 from model import Transformer, Informer, Reformer, Flowformer, Flashformer, \
     iTransformer, iInformer, iReformer, iFlowformer, iFlashformer, \
-    iTransformer_fft, iTransformer_cross, iTransformer_decom
+    iTransformer_fft, iTransformer_cross, iTransformer_decom, \
+    iTransformer_multihead
 
 
 class Exp_Basic(object):
@@ -18,6 +19,7 @@ class Exp_Basic(object):
             'iTransformer_fft': iTransformer_fft,
             'iTransformer_cross': iTransformer_cross,
             'iTransformer_decom': iTransformer_decom,
+            'iTransformer_multihead': iTransformer_multihead,
             'iInformer': iInformer,
             'iReformer': iReformer,
             'iFlowformer': iFlowformer,
