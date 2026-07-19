@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom]')
+                        help='model name, options include: [iTransformer, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -120,6 +120,18 @@ if __name__ == '__main__':
                         help='dynamic source variates selected per target in iTransformer_cross')
     parser.add_argument('--router_temperature', type=float, default=1.0,
                         help='temperature for sparse routing weights in iTransformer_cross')
+    parser.add_argument('--three_patch_len', type=int, default=16,
+                        help='patch length used by the PatchTST branch in iTransformer_three')
+    parser.add_argument('--three_stride', type=int, default=8,
+                        help='patch stride used by the PatchTST branch in iTransformer_three')
+    parser.add_argument('--three_patch_layers', type=int, default=2,
+                        help='number of PatchTST encoder layers in iTransformer_three')
+    parser.add_argument('--three_fusion_hidden', type=int, default=256,
+                        help='hidden width of the dynamic fusion gate in iTransformer_three')
+    parser.add_argument('--three_head_dropout', type=float, default=0.1,
+                        help='dropout before the PatchTST prediction head')
+    parser.add_argument('--three_gamma_init', type=float, default=0.1,
+                        help='initial learnable residual scale gamma in iTransformer_three')
     parser.add_argument('--decomp_moving_avg', type=int, default=25,
                         help='centered moving-average window used by the TimeMixer backbone')
     parser.add_argument('--decomp_lags', type=str, default='0,1,2,4,8',
@@ -286,6 +298,14 @@ if __name__ == '__main__':
                     args.fusion_type,
                     int(args.share_prediction_head),
                 )
+            elif args.model == 'iTransformer_three':
+                setting += '_patch{}s{}_pel{}_fh{}_g{}'.format(
+                    args.three_patch_len,
+                    args.three_stride,
+                    args.three_patch_layers,
+                    args.three_fusion_hidden,
+                    args.three_gamma_init,
+                )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -347,6 +367,14 @@ if __name__ == '__main__':
                 int(args.use_dynamic_mask),
                 args.fusion_type,
                 int(args.share_prediction_head),
+            )
+        elif args.model == 'iTransformer_three':
+            setting += '_patch{}s{}_pel{}_fh{}_g{}'.format(
+                args.three_patch_len,
+                args.three_stride,
+                args.three_patch_layers,
+                args.three_fusion_hidden,
+                args.three_gamma_init,
             )
 
         exp = Exp(args)  # set experiments
