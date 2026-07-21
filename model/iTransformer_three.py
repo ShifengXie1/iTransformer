@@ -309,6 +309,25 @@ class Model(nn.Module):
         gamma_init = float(getattr(configs, 'three_gamma_init', 0.1))
         self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
 
+        self.patch_loss_weight = float(getattr(
+            configs, 'three_patch_loss_weight', 0.2
+        ))
+        self.joint_loss_weight = float(getattr(
+            configs, 'three_joint_loss_weight', 0.2
+        ))
+        self.base_loss_weight = float(getattr(
+            configs, 'three_base_loss_weight', 0.1
+        ))
+        loss_weights = {
+            'three_patch_loss_weight': self.patch_loss_weight,
+            'three_joint_loss_weight': self.joint_loss_weight,
+            'three_base_loss_weight': self.base_loss_weight,
+        }
+        for name, weight in loss_weights.items():
+            if weight < 0:
+                raise ValueError(f'{name} must be non-negative')
+        self._aux_state = None
+
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if x_enc.ndim != 3:
             raise ValueError('x_enc must have shape [batch, seq_len, variables]')
@@ -364,7 +383,27 @@ class Model(nn.Module):
         if self.use_norm:
             scale = stdev[:, 0, :].unsqueeze(1)
             location = means[:, 0, :].unsqueeze(1)
+            patch_output = patch_prediction * scale + location
+            joint_output = joint_prediction * scale + location
+            base_output = base_prediction * scale + location
+            correction_output = scaled_correction * scale
             prediction = prediction * scale + location
+        else:
+            patch_output = patch_prediction
+            joint_output = joint_prediction
+            base_output = base_prediction
+            correction_output = scaled_correction
+
+        # Keep the branch predictions in the same physical scale as the
+        # training target. The experiment runner calls auxiliary_loss(target)
+        # immediately after this forward pass.
+        self._aux_state = {
+            'patch': patch_output,
+            'joint': joint_output,
+            'base': base_output,
+            'correction': correction_output,
+            'final': prediction,
+        } if self.training else None
 
         diagnostics = {
             'patchtst_attention': patch_attentions,
@@ -378,6 +417,71 @@ class Model(nn.Module):
             'num_patches': self.patchtst.patch_num,
         }
         return prediction, diagnostics
+
+    def _aligned_auxiliary_state(self, target):
+        """Align full multivariate forecasts with M/S/MS task targets."""
+        if self._aux_state is None:
+            raise RuntimeError(
+                'A training forward pass is required before computing loss'
+            )
+        if target.ndim != 3:
+            raise ValueError('target must have shape [batch, pred_len, channels]')
+        if target.shape[1] < self.pred_len:
+            raise ValueError(
+                f'Target length must be at least {self.pred_len}, '
+                f'got {target.shape[1]}'
+            )
+        target = target[:, -self.pred_len:, :]
+        target_channels = target.shape[-1]
+        if target_channels > self.n_vars:
+            raise ValueError('Target has more channels than model prediction')
+
+        # The data pipeline places the target variable last for MS tasks,
+        # matching the slicing convention used by the experiment runner.
+        channel_slice = slice(self.n_vars - target_channels, self.n_vars)
+        aligned = {
+            name: prediction[..., channel_slice]
+            for name, prediction in self._aux_state.items()
+        }
+        return aligned, target
+
+    def compute_loss(self, target):
+        """Return final, branch, and dynamic-fusion MSE objectives."""
+        state, target = self._aligned_auxiliary_state(target)
+        patch_loss = F.mse_loss(state['patch'], target)
+        joint_loss = F.mse_loss(state['joint'], target)
+        base_loss = F.mse_loss(state['base'], target)
+        final_loss = F.mse_loss(state['final'], target)
+        auxiliary = (
+            self.patch_loss_weight * patch_loss
+            + self.joint_loss_weight * joint_loss
+            + self.base_loss_weight * base_loss
+        )
+        return {
+            'total': final_loss + auxiliary,
+            'final_loss': final_loss,
+            'patch_loss': patch_loss,
+            'joint_loss': joint_loss,
+            'base_loss': base_loss,
+            'auxiliary_loss': auxiliary,
+        }
+
+    def auxiliary_loss(self, target):
+        """Adapter for Exp_Long_Term_Forecast's auxiliary-loss hook."""
+        if self._aux_state is None:
+            zero = target.new_zeros(())
+            return {'total': zero}
+        losses = self.compute_loss(target)
+        # The runner already adds the final forecast MSE. Only return the
+        # weighted branch/base terms as `total` to avoid counting it twice.
+        return {
+            'total': losses['auxiliary_loss'],
+            'total_loss': losses['total'],
+            'final_loss': losses['final_loss'],
+            'patch_loss': losses['patch_loss'],
+            'joint_loss': losses['joint_loss'],
+            'base_loss': losses['base_loss'],
+        }
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
         prediction, diagnostics = self.forecast(

@@ -132,6 +132,12 @@ if __name__ == '__main__':
                         help='dropout before the PatchTST prediction head')
     parser.add_argument('--three_gamma_init', type=float, default=0.1,
                         help='initial learnable residual scale gamma in iTransformer_three')
+    parser.add_argument('--three_patch_loss_weight', type=float, default=0.2,
+                        help='weight of the channel-independent PatchTST forecast loss')
+    parser.add_argument('--three_joint_loss_weight', type=float, default=0.2,
+                        help='weight of the joint iTransformer forecast loss')
+    parser.add_argument('--three_base_loss_weight', type=float, default=0.1,
+                        help='weight of the dynamically fused base forecast loss')
     parser.add_argument('--decomp_moving_avg', type=int, default=25,
                         help='centered moving-average window used by the TimeMixer backbone')
     parser.add_argument('--decomp_lags', type=str, default='0,1,2,4,8',
@@ -299,12 +305,15 @@ if __name__ == '__main__':
                     int(args.share_prediction_head),
                 )
             elif args.model == 'iTransformer_three':
-                setting += '_patch{}s{}_pel{}_fh{}_g{}'.format(
+                setting += '_patch{}s{}_pel{}_fh{}_g{}_loss{}-{}-{}'.format(
                     args.three_patch_len,
                     args.three_stride,
                     args.three_patch_layers,
                     args.three_fusion_hidden,
                     args.three_gamma_init,
+                    args.three_patch_loss_weight,
+                    args.three_joint_loss_weight,
+                    args.three_base_loss_weight,
                 )
 
             exp = Exp(args)  # set experiments
@@ -369,12 +378,15 @@ if __name__ == '__main__':
                 int(args.share_prediction_head),
             )
         elif args.model == 'iTransformer_three':
-            setting += '_patch{}s{}_pel{}_fh{}_g{}'.format(
+            setting += '_patch{}s{}_pel{}_fh{}_g{}_loss{}-{}-{}'.format(
                 args.three_patch_len,
                 args.three_stride,
                 args.three_patch_layers,
                 args.three_fusion_hidden,
                 args.three_gamma_init,
+                args.three_patch_loss_weight,
+                args.three_joint_loss_weight,
+                args.three_base_loss_weight,
             )
 
         exp = Exp(args)  # set experiments

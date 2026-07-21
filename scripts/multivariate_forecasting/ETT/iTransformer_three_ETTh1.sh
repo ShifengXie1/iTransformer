@@ -7,6 +7,9 @@ three_patch_layers=2
 three_fusion_hidden=256
 three_head_dropout=0.1
 three_gamma_init=0.1
+three_patch_loss_weight=0.2
+three_joint_loss_weight=0.2
+three_base_loss_weight=0.1
 
 python -u run.py \
   --is_training 1 \
@@ -31,6 +34,9 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_patch_loss_weight $three_patch_loss_weight \
+  --three_joint_loss_weight $three_joint_loss_weight \
+  --three_base_loss_weight $three_base_loss_weight \
   --itr 1
 
 python -u run.py \
@@ -56,6 +62,9 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_patch_loss_weight $three_patch_loss_weight \
+  --three_joint_loss_weight $three_joint_loss_weight \
+  --three_base_loss_weight $three_base_loss_weight \
   --itr 1
 
 python -u run.py \
@@ -81,6 +90,9 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_patch_loss_weight $three_patch_loss_weight \
+  --three_joint_loss_weight $three_joint_loss_weight \
+  --three_base_loss_weight $three_base_loss_weight \
   --itr 1
 
 python -u run.py \
@@ -106,4 +118,7 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_patch_loss_weight $three_patch_loss_weight \
+  --three_joint_loss_weight $three_joint_loss_weight \
+  --three_base_loss_weight $three_base_loss_weight \
   --itr 1
