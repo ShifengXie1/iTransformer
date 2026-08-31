@@ -131,13 +131,27 @@ if __name__ == '__main__':
     parser.add_argument('--three_head_dropout', type=float, default=0.1,
                         help='dropout before the PatchTST prediction head')
     parser.add_argument('--three_gamma_init', type=float, default=0.1,
-                        help='initial learnable residual scale gamma in iTransformer_three')
+                        help='initial dynamic refinement step-gate value in iTransformer_three')
+    parser.add_argument('--three_use_refinement', type=int, choices=[0, 1], default=1,
+                        help='enable prediction-aware iterative refinement in iTransformer_three')
+    parser.add_argument('--three_refinement_steps', type=int, default=2,
+                        help='number of shared prediction refinement steps')
+    parser.add_argument('--three_refiner_top_k', type=int, default=3,
+                        help='routed source variables per target during refinement')
+    parser.add_argument('--three_router_temperature', type=float, default=1.0,
+                        help='temperature of the sparse refinement router')
+    parser.add_argument('--three_cross_gate_init', type=float, default=0.1,
+                        help='initial contribution gate for cross-variable correction')
     parser.add_argument('--three_patch_loss_weight', type=float, default=0.2,
                         help='weight of the channel-independent PatchTST forecast loss')
     parser.add_argument('--three_joint_loss_weight', type=float, default=0.2,
                         help='weight of the joint iTransformer forecast loss')
     parser.add_argument('--three_base_loss_weight', type=float, default=0.1,
                         help='weight of the dynamically fused base forecast loss')
+    parser.add_argument('--three_refinement_loss_weight', type=float, default=0.1,
+                        help='weight of intermediate refinement deep supervision')
+    parser.add_argument('--three_monotonic_loss_weight', type=float, default=0.05,
+                        help='weight penalizing refinement steps that increase MSE')
     parser.add_argument('--decomp_moving_avg', type=int, default=25,
                         help='centered moving-average window used by the TimeMixer backbone')
     parser.add_argument('--decomp_lags', type=str, default='0,1,2,4,8',
@@ -305,15 +319,20 @@ if __name__ == '__main__':
                     int(args.share_prediction_head),
                 )
             elif args.model == 'iTransformer_three':
-                setting += '_patch{}s{}_pel{}_fh{}_g{}_loss{}-{}-{}'.format(
+                setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
                     args.three_patch_len,
                     args.three_stride,
                     args.three_patch_layers,
                     args.three_fusion_hidden,
+                    args.three_use_refinement,
+                    args.three_refinement_steps,
+                    args.three_refiner_top_k,
                     args.three_gamma_init,
                     args.three_patch_loss_weight,
                     args.three_joint_loss_weight,
                     args.three_base_loss_weight,
+                    args.three_refinement_loss_weight,
+                    args.three_monotonic_loss_weight,
                 )
 
             exp = Exp(args)  # set experiments
@@ -378,15 +397,20 @@ if __name__ == '__main__':
                 int(args.share_prediction_head),
             )
         elif args.model == 'iTransformer_three':
-            setting += '_patch{}s{}_pel{}_fh{}_g{}_loss{}-{}-{}'.format(
+            setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
                 args.three_patch_len,
                 args.three_stride,
                 args.three_patch_layers,
                 args.three_fusion_hidden,
+                args.three_use_refinement,
+                args.three_refinement_steps,
+                args.three_refiner_top_k,
                 args.three_gamma_init,
                 args.three_patch_loss_weight,
                 args.three_joint_loss_weight,
                 args.three_base_loss_weight,
+                args.three_refinement_loss_weight,
+                args.three_monotonic_loss_weight,
             )
 
         exp = Exp(args)  # set experiments

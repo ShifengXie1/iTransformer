@@ -7,9 +7,16 @@ three_patch_layers=2
 three_fusion_hidden=256
 three_head_dropout=0.1
 three_gamma_init=0.1
+three_use_refinement=1
+three_refinement_steps=2
+three_refiner_top_k=3
+three_router_temperature=1.0
+three_cross_gate_init=0.1
 three_patch_loss_weight=0.2
 three_joint_loss_weight=0.2
 three_base_loss_weight=0.1
+three_refinement_loss_weight=0.1
+three_monotonic_loss_weight=0.05
 
 python -u run.py \
   --is_training 1 \
@@ -34,9 +41,16 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_use_refinement $three_use_refinement \
+  --three_refinement_steps $three_refinement_steps \
+  --three_refiner_top_k $three_refiner_top_k \
+  --three_router_temperature $three_router_temperature \
+  --three_cross_gate_init $three_cross_gate_init \
   --three_patch_loss_weight $three_patch_loss_weight \
   --three_joint_loss_weight $three_joint_loss_weight \
   --three_base_loss_weight $three_base_loss_weight \
+  --three_refinement_loss_weight $three_refinement_loss_weight \
+  --three_monotonic_loss_weight $three_monotonic_loss_weight \
   --itr 1
 
 python -u run.py \
@@ -62,9 +76,16 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_use_refinement $three_use_refinement \
+  --three_refinement_steps $three_refinement_steps \
+  --three_refiner_top_k $three_refiner_top_k \
+  --three_router_temperature $three_router_temperature \
+  --three_cross_gate_init $three_cross_gate_init \
   --three_patch_loss_weight $three_patch_loss_weight \
   --three_joint_loss_weight $three_joint_loss_weight \
   --three_base_loss_weight $three_base_loss_weight \
+  --three_refinement_loss_weight $three_refinement_loss_weight \
+  --three_monotonic_loss_weight $three_monotonic_loss_weight \
   --itr 1
 
 python -u run.py \
@@ -90,9 +111,16 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_use_refinement $three_use_refinement \
+  --three_refinement_steps $three_refinement_steps \
+  --three_refiner_top_k $three_refiner_top_k \
+  --three_router_temperature $three_router_temperature \
+  --three_cross_gate_init $three_cross_gate_init \
   --three_patch_loss_weight $three_patch_loss_weight \
   --three_joint_loss_weight $three_joint_loss_weight \
   --three_base_loss_weight $three_base_loss_weight \
+  --three_refinement_loss_weight $three_refinement_loss_weight \
+  --three_monotonic_loss_weight $three_monotonic_loss_weight \
   --itr 1
 
 python -u run.py \
@@ -118,7 +146,14 @@ python -u run.py \
   --three_fusion_hidden $three_fusion_hidden \
   --three_head_dropout $three_head_dropout \
   --three_gamma_init $three_gamma_init \
+  --three_use_refinement $three_use_refinement \
+  --three_refinement_steps $three_refinement_steps \
+  --three_refiner_top_k $three_refiner_top_k \
+  --three_router_temperature $three_router_temperature \
+  --three_cross_gate_init $three_cross_gate_init \
   --three_patch_loss_weight $three_patch_loss_weight \
   --three_joint_loss_weight $three_joint_loss_weight \
   --three_base_loss_weight $three_base_loss_weight \
+  --three_refinement_loss_weight $three_refinement_loss_weight \
+  --three_monotonic_loss_weight $three_monotonic_loss_weight \
   --itr 1
