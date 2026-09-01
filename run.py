@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -88,6 +88,29 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # iTransformer prediction-feedback fixed-point output refinement
+    parser.add_argument('--refuture_splits', type=str, default='0.25,0.5,0.75',
+                        help='comma-separated forecast-prefix fractions or absolute horizons')
+    parser.add_argument('--refuture_steps', type=int, default=2,
+                        help='number of output-space fixed-point optimization steps')
+    parser.add_argument('--refuture_step_size', type=float, default=0.2,
+                        help='initial positive fixed-point step size')
+    parser.add_argument('--refuture_anchor_weight', type=float, default=0.1,
+                        help='weight anchoring optimized output to the direct forecast')
+    parser.add_argument('--refuture_max_update', type=float, default=0.5,
+                        help='maximum per-step update as a fraction of input standard deviation')
+    parser.add_argument('--refuture_learnable_step', type=int, choices=[0, 1], default=1,
+                        help='learn one positive step size per fixed-point iteration')
+    parser.add_argument('--refuture_differentiable', type=int, choices=[0, 1], default=0,
+                        help='use memory-intensive second-order differentiable optimization')
+    parser.add_argument('--refuture_base_loss_weight', type=float, default=0.2,
+                        help='auxiliary weight for the direct iTransformer forecast')
+    parser.add_argument('--refuture_consistency_loss_weight', type=float, default=0.05,
+                        help='auxiliary weight for forecast fixed-point consistency')
+    parser.add_argument('--refuture_safe_loss_weight', type=float, default=0.1,
+                        help='weight penalizing refinements worse than the direct forecast')
+    parser.add_argument('--refuture_update_loss_weight', type=float, default=0.01,
+                        help='weight regularizing the scale-normalized output update')
     # iTransformer multi-token-head variants
     parser.add_argument('--num_token_heads', type=int, default=4,
                         help='number of independent dynamic token branches')
@@ -334,6 +357,15 @@ if __name__ == '__main__':
                     args.three_refinement_loss_weight,
                     args.three_monotonic_loss_weight,
                 )
+            elif args.model == 'iTransformer_refuture':
+                setting += '_rfsp{}x{}_eta{}_a{}_clip{}_d{}'.format(
+                    args.refuture_splits.replace(',', '-'),
+                    args.refuture_steps,
+                    args.refuture_step_size,
+                    args.refuture_anchor_weight,
+                    args.refuture_max_update,
+                    args.refuture_differentiable,
+                )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -411,6 +443,15 @@ if __name__ == '__main__':
                 args.three_base_loss_weight,
                 args.three_refinement_loss_weight,
                 args.three_monotonic_loss_weight,
+            )
+        elif args.model == 'iTransformer_refuture':
+            setting += '_rfsp{}x{}_eta{}_a{}_clip{}_d{}'.format(
+                args.refuture_splits.replace(',', '-'),
+                args.refuture_steps,
+                args.refuture_step_size,
+                args.refuture_anchor_weight,
+                args.refuture_max_update,
+                args.refuture_differentiable,
             )
 
         exp = Exp(args)  # set experiments
