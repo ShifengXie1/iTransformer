@@ -1,4 +1,13 @@
-"""Multi-token-head iTransformer with one shared variate encoder."""
+"""Adaptive multi-view token heads for iTransformer.
+
+The ``n_heads`` used by the original iTransformer is already ordinary
+multi-head self-attention over variate tokens.  This module adds a different
+axis of heads *before* attention: every variate history is embedded into
+several full-width tokens, just as ordinary attention projects one token into
+several query/key/value subspaces.  Head 0 is an unmasked iTransformer anchor;
+the remaining heads learn input-conditioned temporal views.  All views reuse
+one variate encoder and their forecasts are fused per sample and variate.
+"""
 
 import math
 from typing import Dict, List, Optional, Tuple
@@ -12,11 +21,12 @@ from layers.Transformer_EncDec import Encoder, EncoderLayer
 
 
 class DynamicTokenGenerator(nn.Module):
-    """Generate H independent tokens for every input variate."""
+    """Generate one anchor and H-1 adaptive tokens for every input series."""
 
     def __init__(
             self, seq_len: int, d_model: int, num_heads: int,
-            mask_hidden: int, temperature: float, use_dynamic_mask: bool
+            mask_hidden: int, temperature: float, use_dynamic_mask: bool,
+            dropout: float,
     ) -> None:
         super().__init__()
         if num_heads < 1:
@@ -31,22 +41,32 @@ class DynamicTokenGenerator(nn.Module):
         self.temperature = float(temperature)
         self.use_dynamic_mask = bool(use_dynamic_mask)
 
+        # The anchor head deliberately has no mask generator.  Consequently,
+        # num_heads=1 follows the original iTransformer embedding path and is
+        # a clean architectural ablation instead of another dynamic model.
         self.mask_generators = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(seq_len, mask_hidden),
                 nn.GELU(),
                 nn.Linear(mask_hidden, seq_len),
             )
-            for _ in range(num_heads)
+            for _ in range(num_heads - 1)
         ])
         self.projections = nn.ModuleList([
             nn.Linear(seq_len, d_model) for _ in range(num_heads)
         ])
-        self.normalizations = nn.ModuleList([
-            nn.LayerNorm(d_model) for _ in range(num_heads)
-        ])
-        self.head_embedding = nn.Parameter(torch.empty(num_heads, d_model))
+        self.head_embedding = nn.Parameter(
+            torch.empty(max(num_heads - 1, 0), d_model)
+        )
+        self.dropout = nn.Dropout(dropout)
         nn.init.normal_(self.head_embedding, mean=0.0, std=0.02)
+
+        # Start adaptive heads from the information-preserving all-one mask.
+        # Independent projections and head embeddings still break symmetry,
+        # while training does not begin by randomly erasing observations.
+        for generator in self.mask_generators:
+            nn.init.zeros_(generator[-1].weight)
+            nn.init.zeros_(generator[-1].bias)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B, N, L]
@@ -59,8 +79,8 @@ class DynamicTokenGenerator(nn.Module):
         tokens: List[torch.Tensor] = []
         masks: List[torch.Tensor] = []
         for head in range(self.num_heads):
-            if self.use_dynamic_mask:
-                mask_logits = self.mask_generators[head](x)
+            if head > 0 and self.use_dynamic_mask:
+                mask_logits = self.mask_generators[head - 1](x)
                 mask = self.seq_len * torch.softmax(
                     mask_logits / self.temperature, dim=-1
                 )
@@ -72,9 +92,9 @@ class DynamicTokenGenerator(nn.Module):
                 projection_input = x
 
             token = self.projections[head](projection_input)
-            token = token + self.head_embedding[head].view(1, 1, -1)
-            token = self.normalizations[head](token)
-            tokens.append(token)
+            if head > 0:
+                token = token + self.head_embedding[head - 1].view(1, 1, -1)
+            tokens.append(self.dropout(token))
             masks.append(mask)
 
         return torch.stack(tokens, dim=1), torch.stack(masks, dim=1)
@@ -121,6 +141,7 @@ class Model(nn.Module):
             use_dynamic_mask=bool(
                 getattr(configs, 'use_dynamic_mask', True)
             ),
+            dropout=float(configs.dropout),
         )
 
         # This is deliberately one Encoder instance. Token branches are folded
@@ -170,6 +191,9 @@ class Model(nn.Module):
         self.lambda_redundancy = float(
             getattr(configs, 'lambda_redundancy', 1e-3)
         )
+        self.lambda_mask_diversity = float(
+            getattr(configs, 'lambda_mask_diversity', 1e-3)
+        )
         self.lambda_contribution = float(
             getattr(configs, 'lambda_contribution', 0.05)
         )
@@ -181,6 +205,7 @@ class Model(nn.Module):
         )
         for name in (
                 'lambda_branch', 'lambda_redundancy',
+                'lambda_mask_diversity',
                 'lambda_contribution', 'lambda_balance',
                 'contribution_margin'):
             if getattr(self, name) < 0:
@@ -236,6 +261,15 @@ class Model(nn.Module):
                 f'Expected x_enc [B, {self.seq_len}, N], '
                 f'got {tuple(x_enc.shape)}'
             )
+        if x_mark_enc is not None:
+            if (
+                    x_mark_enc.ndim != 3
+                    or x_mark_enc.shape[0] != x_enc.shape[0]
+                    or x_mark_enc.shape[1] != self.seq_len):
+                raise ValueError(
+                    'x_mark_enc must have shape [B, seq_len, M] and match '
+                    f'x_enc; got {tuple(x_mark_enc.shape)}'
+                )
 
         if self.use_norm:
             means = x_enc.mean(dim=1, keepdim=True).detach()
@@ -250,16 +284,27 @@ class Model(nn.Module):
             stdev = None
 
         batch, _, variates = normalized.shape
-        tokens, dynamic_masks = self.tokenizer(normalized.transpose(1, 2))
+        tokenizer_input = normalized.transpose(1, 2)
+        if x_mark_enc is not None:
+            # Match DataEmbedding_inverted: timestamp/covariate histories are
+            # additional tokens used as context, never forecast as targets.
+            tokenizer_input = torch.cat(
+                [tokenizer_input, x_mark_enc.transpose(1, 2)], dim=1
+            )
+        tokens, dynamic_masks = self.tokenizer(tokenizer_input)
+        token_count = tokens.shape[2]
         encoder_input = tokens.reshape(
-            batch * self.num_token_heads, variates, self.d_model
+            batch * self.num_token_heads, token_count, self.d_model
         )
         encoder_output, attns = self.encoder(
             encoder_input, attn_mask=None
         )
-        representations = encoder_output.reshape(
-            batch, self.num_token_heads, variates, self.d_model
+        all_representations = encoder_output.reshape(
+            batch, self.num_token_heads, token_count, self.d_model
         )
+        # Covariate tokens participate in attention, but only the first N
+        # variate tokens are decoded, following the original iTransformer.
+        representations = all_representations[:, :, :variates]
 
         branch_predictions = self._predict_branches(representations)
         if self.use_norm:
@@ -278,8 +323,10 @@ class Model(nn.Module):
             'branch_predictions': branch_predictions,
             'tokens': tokens,
             'representations': representations,
+            'all_representations': all_representations,
             'gate_weights': gate_weights,
             'dynamic_masks': dynamic_masks,
+            'target_dynamic_masks': dynamic_masks[:, :, :variates],
         }
         self._aux_state = outputs if self.training else None
         return outputs, self._reshape_attentions(
@@ -294,6 +341,11 @@ class Model(nn.Module):
                 'No training forward state is available. Call the model in '
                 'training mode before computing multihead losses.'
             )
+        if target.ndim != 3 or target.shape[1] != self.pred_len:
+            raise ValueError(
+                f'Expected target [B, {self.pred_len}, N], '
+                f'got {tuple(target.shape)}'
+            )
         state = self._aux_state
         model_channels = state['prediction'].shape[-1]
         target_channels = target.shape[-1]
@@ -307,6 +359,7 @@ class Model(nn.Module):
             # Redundancy is defined across every encoded input variable, not
             # just the selected output channel in an MS forecasting task.
             'representations': state['representations'],
+            'target_dynamic_masks': state['target_dynamic_masks'],
         }
         return aligned, target[..., -target_channels:]
 
@@ -327,6 +380,29 @@ class Model(nn.Module):
             device=representations.device,
         ).unsqueeze(0)
         return correlation.pow(2).masked_select(off_diagonal).mean()
+
+    def _mask_diversity_loss(self, masks: torch.Tensor) -> torch.Tensor:
+        """Discourage adaptive token heads from selecting the same history."""
+        # Head 0 is the fixed global anchor. With fewer than two adaptive
+        # heads there is no pair whose redundancy can be measured.
+        if not self.tokenizer.use_dynamic_mask or self.num_token_heads < 3:
+            return masks.new_zeros(())
+
+        adaptive_masks = masks[:, 1:].flatten(start_dim=2)
+        adaptive_masks = adaptive_masks - adaptive_masks.mean(
+            dim=-1, keepdim=True
+        )
+        adaptive_masks = F.normalize(
+            adaptive_masks, p=2, dim=-1, eps=1e-8
+        )
+        similarity = torch.matmul(
+            adaptive_masks, adaptive_masks.transpose(1, 2)
+        )
+        adaptive_heads = self.num_token_heads - 1
+        off_diagonal = ~torch.eye(
+            adaptive_heads, dtype=torch.bool, device=masks.device
+        ).unsqueeze(0)
+        return similarity.pow(2).masked_select(off_diagonal).mean()
 
     def _contribution_loss(
             self, prediction: torch.Tensor,
@@ -385,6 +461,9 @@ class Model(nn.Module):
             target.unsqueeze(1).expand_as(state['branch_predictions']),
         )
         redundancy_loss = self._redundancy_loss(state['representations'])
+        mask_diversity_loss = self._mask_diversity_loss(
+            state['target_dynamic_masks']
+        )
         contribution_loss = self._contribution_loss(
             state['prediction'],
             state['branch_predictions'],
@@ -395,6 +474,7 @@ class Model(nn.Module):
         auxiliary = (
             self.lambda_branch * branch_loss
             + self.lambda_redundancy * redundancy_loss
+            + self.lambda_mask_diversity * mask_diversity_loss
             + self.lambda_contribution * contribution_loss
             + self.lambda_balance * balance_loss
         )
@@ -403,6 +483,7 @@ class Model(nn.Module):
             'forecast_loss': forecast_loss,
             'branch_loss': branch_loss,
             'redundancy_loss': redundancy_loss,
+            'mask_diversity_loss': mask_diversity_loss,
             'contribution_loss': contribution_loss,
             'balance_loss': balance_loss,
             'auxiliary_loss': auxiliary,
@@ -420,6 +501,7 @@ class Model(nn.Module):
             'forecast_loss': losses['forecast_loss'],
             'branch_loss': losses['branch_loss'],
             'redundancy_loss': losses['redundancy_loss'],
+            'mask_diversity_loss': losses['mask_diversity_loss'],
             'contribution_loss': losses['contribution_loss'],
             'balance_loss': losses['balance_loss'],
         }

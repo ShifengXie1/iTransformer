@@ -131,6 +131,8 @@ if __name__ == '__main__':
                         help='weight of the mean per-branch forecast loss')
     parser.add_argument('--lambda_redundancy', type=float, default=1e-3,
                         help='weight of cross-branch representation correlation')
+    parser.add_argument('--lambda_mask_diversity', type=float, default=1e-3,
+                        help='weight of adaptive temporal-mask correlation')
     parser.add_argument('--lambda_contribution', type=float, default=0.05,
                         help='weight of leave-one-branch-out contribution loss')
     parser.add_argument('--lambda_balance', type=float, default=0.01,

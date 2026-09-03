@@ -28,6 +28,7 @@ python -u run.py \
   --share_prediction_head 0 \
   --lambda_branch 0.2 \
   --lambda_redundancy 0.001 \
+  --lambda_mask_diversity 0.001 \
   --lambda_contribution 0.05 \
   --lambda_balance 0.01 \
   --contribution_margin 0.0001 \
@@ -59,6 +60,7 @@ python -u run.py \
   --share_prediction_head 0 \
   --lambda_branch 0.2 \
   --lambda_redundancy 0.001 \
+  --lambda_mask_diversity 0.001 \
   --lambda_contribution 0.05 \
   --lambda_balance 0.01 \
   --contribution_margin 0.0001 \
@@ -90,6 +92,7 @@ python -u run.py \
   --share_prediction_head 0 \
   --lambda_branch 0.2 \
   --lambda_redundancy 0.001 \
+  --lambda_mask_diversity 0.001 \
   --lambda_contribution 0.05 \
   --lambda_balance 0.01 \
   --contribution_margin 0.0001 \
@@ -121,6 +124,7 @@ python -u run.py \
   --share_prediction_head 0 \
   --lambda_branch 0.2 \
   --lambda_redundancy 0.001 \
+  --lambda_mask_diversity 0.001 \
   --lambda_contribution 0.05 \
   --lambda_balance 0.01 \
   --contribution_margin 0.0001 \
