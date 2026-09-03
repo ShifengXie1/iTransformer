@@ -111,34 +111,30 @@ if __name__ == '__main__':
                         help='weight penalizing refinements worse than the direct forecast')
     parser.add_argument('--refuture_update_loss_weight', type=float, default=0.01,
                         help='weight regularizing the scale-normalized output update')
-    # iTransformer multi-token-head variants
+    # residual multi-view token-head iTransformer
     parser.add_argument('--num_token_heads', type=int, default=4,
-                        help='number of independent dynamic token branches')
+                        help='total temporal views, including the original iTransformer token')
     parser.add_argument('--use_dynamic_mask', type=int, choices=[0, 1], default=1,
                         help='use input-conditioned temporal masks: 1 enables, 0 disables')
     parser.add_argument('--token_mask_hidden', type=int, default=64,
                         help='hidden width of every temporal mask generator')
     parser.add_argument('--token_temperature', type=float, default=1.0,
                         help='softmax temperature used by temporal masks')
+    parser.add_argument('--token_scales', type=str, default='auto',
+                        help='auto or comma-separated moving-average pyramid boundaries')
+    parser.add_argument('--view_attention_heads', type=int, default=4,
+                        help='attention heads used to mix views inside each variate')
+    parser.add_argument('--view_residual_init', type=float, default=0.0,
+                        help='initial residual correction scale in (-1, 1); 0 starts at baseline')
     parser.add_argument('--gate_temperature', type=float, default=1.0,
-                        help='softmax temperature used by branch fusion')
+                        help='sigmoid temperature used by the residual view gate')
     parser.add_argument('--fusion_type', type=str, default='dynamic',
                         choices=['mean', 'learnable_global', 'dynamic'],
-                        help='branch prediction fusion strategy')
-    parser.add_argument('--share_prediction_head', type=int, choices=[0, 1], default=0,
-                        help='share one prediction head: 1 shares, 0 uses independent heads')
-    parser.add_argument('--lambda_branch', type=float, default=0.2,
-                        help='weight of the mean per-branch forecast loss')
-    parser.add_argument('--lambda_redundancy', type=float, default=1e-3,
-                        help='weight of cross-branch representation correlation')
-    parser.add_argument('--lambda_mask_diversity', type=float, default=1e-3,
-                        help='weight of adaptive temporal-mask correlation')
-    parser.add_argument('--lambda_contribution', type=float, default=0.05,
-                        help='weight of leave-one-branch-out contribution loss')
-    parser.add_argument('--lambda_balance', type=float, default=0.01,
-                        help='weight of the gate-to-uniform balance loss')
-    parser.add_argument('--contribution_margin', type=float, default=1e-4,
-                        help='required error increase after removing a branch')
+                        help='intra-variate temporal-view fusion strategy')
+    parser.add_argument('--lambda_redundancy', type=float, default=0.0,
+                        help='optional weak token-view diversity weight')
+    parser.add_argument('--lambda_mask_diversity', type=float, default=0.0,
+                        help='optional weak temporal-mask diversity weight')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
     parser.add_argument('--cross_top_k', type=int, default=3,
@@ -337,11 +333,13 @@ if __name__ == '__main__':
                     args.decomp_router_temperature,
                 )
             elif args.model == 'iTransformer_multihead':
-                setting += '_th{}_mask{}_fusion{}_share{}'.format(
+                setting += '_th{}_mask{}_sc{}_va{}_fusion{}_ri{}'.format(
                     args.num_token_heads,
                     int(args.use_dynamic_mask),
+                    args.token_scales.replace(',', '-'),
+                    args.view_attention_heads,
                     args.fusion_type,
-                    int(args.share_prediction_head),
+                    args.view_residual_init,
                 )
             elif args.model == 'iTransformer_three':
                 setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
@@ -424,11 +422,13 @@ if __name__ == '__main__':
                 args.decomp_router_temperature,
             )
         elif args.model == 'iTransformer_multihead':
-            setting += '_th{}_mask{}_fusion{}_share{}'.format(
+            setting += '_th{}_mask{}_sc{}_va{}_fusion{}_ri{}'.format(
                 args.num_token_heads,
                 int(args.use_dynamic_mask),
+                args.token_scales.replace(',', '-'),
+                args.view_attention_heads,
                 args.fusion_type,
-                int(args.share_prediction_head),
+                args.view_residual_init,
             )
         elif args.model == 'iTransformer_three':
             setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
