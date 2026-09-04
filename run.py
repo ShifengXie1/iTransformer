@@ -117,6 +117,10 @@ if __name__ == '__main__':
                         help='number of disjoint variable groups / independent iTransformer branches')
     parser.add_argument('--variable_groups', type=str, default='auto',
                         help="auto for balanced consecutive groups, or explicit groups such as '0,2,4;1,3,5,6'")
+    parser.add_argument('--group_head_dim', type=int, default=0,
+                        help='dimension of each explicit group head; 0 uses ceil(d_model / num_variable_groups)')
+    parser.add_argument('--group_residual_init', type=float, default=0.1,
+                        help='initial scale of the cross-group attention correction')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
     parser.add_argument('--cross_top_k', type=int, default=3,
@@ -315,9 +319,11 @@ if __name__ == '__main__':
                     args.decomp_router_temperature,
                 )
             elif args.model == 'iTransformer_multihead':
-                setting += '_vg{}_groups{}'.format(
+                setting += '_vg{}_groups{}_hd{}_ri{}'.format(
                     args.num_variable_groups,
                     args.variable_groups.replace(',', '-').replace(';', '_'),
+                    args.group_head_dim,
+                    args.group_residual_init,
                 )
             elif args.model == 'iTransformer_three':
                 setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
@@ -400,9 +406,11 @@ if __name__ == '__main__':
                 args.decomp_router_temperature,
             )
         elif args.model == 'iTransformer_multihead':
-            setting += '_vg{}_groups{}'.format(
+            setting += '_vg{}_groups{}_hd{}_ri{}'.format(
                 args.num_variable_groups,
                 args.variable_groups.replace(',', '-').replace(';', '_'),
+                args.group_head_dim,
+                args.group_residual_init,
             )
         elif args.model == 'iTransformer_three':
             setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(

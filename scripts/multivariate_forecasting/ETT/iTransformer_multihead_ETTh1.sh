@@ -23,6 +23,8 @@ python -u run.py \
   --d_ff 256 \
   --num_variable_groups 2 \
   --variable_groups auto \
+  --group_head_dim 0 \
+  --group_residual_init 0.1 \
   --itr 1
 
 python -u run.py \
@@ -44,6 +46,8 @@ python -u run.py \
   --d_ff 256 \
   --num_variable_groups 2 \
   --variable_groups auto \
+  --group_head_dim 0 \
+  --group_residual_init 0.1 \
   --itr 1
 
 python -u run.py \
@@ -65,6 +69,8 @@ python -u run.py \
   --d_ff 512 \
   --num_variable_groups 2 \
   --variable_groups auto \
+  --group_head_dim 0 \
+  --group_residual_init 0.1 \
   --itr 1
 
 python -u run.py \
@@ -86,4 +92,6 @@ python -u run.py \
   --d_ff 512 \
   --num_variable_groups 2 \
   --variable_groups auto \
+  --group_head_dim 0 \
+  --group_residual_init 0.1 \
   --itr 1
