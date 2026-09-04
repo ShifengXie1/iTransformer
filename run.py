@@ -111,30 +111,12 @@ if __name__ == '__main__':
                         help='weight penalizing refinements worse than the direct forecast')
     parser.add_argument('--refuture_update_loss_weight', type=float, default=0.01,
                         help='weight regularizing the scale-normalized output update')
-    # residual multi-view token-head iTransformer
-    parser.add_argument('--num_token_heads', type=int, default=4,
-                        help='total temporal views, including the original iTransformer token')
-    parser.add_argument('--use_dynamic_mask', type=int, choices=[0, 1], default=1,
-                        help='use input-conditioned temporal masks: 1 enables, 0 disables')
-    parser.add_argument('--token_mask_hidden', type=int, default=64,
-                        help='hidden width of every temporal mask generator')
-    parser.add_argument('--token_temperature', type=float, default=1.0,
-                        help='softmax temperature used by temporal masks')
-    parser.add_argument('--token_scales', type=str, default='auto',
-                        help='auto or comma-separated moving-average pyramid boundaries')
-    parser.add_argument('--view_attention_heads', type=int, default=4,
-                        help='attention heads used to mix views inside each variate')
-    parser.add_argument('--view_residual_init', type=float, default=0.0,
-                        help='initial residual correction scale in (-1, 1); 0 starts at baseline')
-    parser.add_argument('--gate_temperature', type=float, default=1.0,
-                        help='sigmoid temperature used by the residual view gate')
-    parser.add_argument('--fusion_type', type=str, default='dynamic',
-                        choices=['mean', 'learnable_global', 'dynamic'],
-                        help='intra-variate temporal-view fusion strategy')
-    parser.add_argument('--lambda_redundancy', type=float, default=0.0,
-                        help='optional weak token-view diversity weight')
-    parser.add_argument('--lambda_mask_diversity', type=float, default=0.0,
-                        help='optional weak temporal-mask diversity weight')
+    # grouped-variable multi-branch iTransformer
+    parser.add_argument('--num_variable_groups', '--num_token_heads',
+                        dest='num_variable_groups', type=int, default=2,
+                        help='number of disjoint variable groups / independent iTransformer branches')
+    parser.add_argument('--variable_groups', type=str, default='auto',
+                        help="auto for balanced consecutive groups, or explicit groups such as '0,2,4;1,3,5,6'")
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
     parser.add_argument('--cross_top_k', type=int, default=3,
@@ -333,13 +315,9 @@ if __name__ == '__main__':
                     args.decomp_router_temperature,
                 )
             elif args.model == 'iTransformer_multihead':
-                setting += '_th{}_mask{}_sc{}_va{}_fusion{}_ri{}'.format(
-                    args.num_token_heads,
-                    int(args.use_dynamic_mask),
-                    args.token_scales.replace(',', '-'),
-                    args.view_attention_heads,
-                    args.fusion_type,
-                    args.view_residual_init,
+                setting += '_vg{}_groups{}'.format(
+                    args.num_variable_groups,
+                    args.variable_groups.replace(',', '-').replace(';', '_'),
                 )
             elif args.model == 'iTransformer_three':
                 setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
@@ -422,13 +400,9 @@ if __name__ == '__main__':
                 args.decomp_router_temperature,
             )
         elif args.model == 'iTransformer_multihead':
-            setting += '_th{}_mask{}_sc{}_va{}_fusion{}_ri{}'.format(
-                args.num_token_heads,
-                int(args.use_dynamic_mask),
-                args.token_scales.replace(',', '-'),
-                args.view_attention_heads,
-                args.fusion_type,
-                args.view_residual_init,
+            setting += '_vg{}_groups{}'.format(
+                args.num_variable_groups,
+                args.variable_groups.replace(',', '-').replace(';', '_'),
             )
         elif args.model == 'iTransformer_three':
             setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(

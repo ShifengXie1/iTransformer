@@ -2,8 +2,8 @@ export CUDA_VISIBLE_DEVICES=0
 
 model_name=iTransformer_multihead
 
-# Four views = original anchor + high-frequency + mid-frequency + trend.
-# A zero residual initialization makes epoch zero exactly match iTransformer.
+# ETTh1 has seven variables. auto creates two strict groups:
+# [0, 1, 2, 3] and [4, 5, 6]. Use --variable_groups to override them.
 python -u run.py \
   --is_training 1 \
   --root_path ./dataset/ETT-small/ \
@@ -21,17 +21,8 @@ python -u run.py \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
-  --num_token_heads 4 \
-  --token_scales auto \
-  --use_dynamic_mask 1 \
-  --token_mask_hidden 64 \
-  --token_temperature 1.0 \
-  --view_attention_heads 4 \
-  --view_residual_init 0.0 \
-  --gate_temperature 1.0 \
-  --fusion_type dynamic \
-  --lambda_redundancy 0 \
-  --lambda_mask_diversity 0 \
+  --num_variable_groups 2 \
+  --variable_groups auto \
   --itr 1
 
 python -u run.py \
@@ -51,17 +42,8 @@ python -u run.py \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
-  --num_token_heads 4 \
-  --token_scales auto \
-  --use_dynamic_mask 1 \
-  --token_mask_hidden 64 \
-  --token_temperature 1.0 \
-  --view_attention_heads 4 \
-  --view_residual_init 0.0 \
-  --gate_temperature 1.0 \
-  --fusion_type dynamic \
-  --lambda_redundancy 0 \
-  --lambda_mask_diversity 0 \
+  --num_variable_groups 2 \
+  --variable_groups auto \
   --itr 1
 
 python -u run.py \
@@ -81,17 +63,8 @@ python -u run.py \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
-  --num_token_heads 4 \
-  --token_scales auto \
-  --use_dynamic_mask 1 \
-  --token_mask_hidden 64 \
-  --token_temperature 1.0 \
-  --view_attention_heads 4 \
-  --view_residual_init 0.0 \
-  --gate_temperature 1.0 \
-  --fusion_type dynamic \
-  --lambda_redundancy 0 \
-  --lambda_mask_diversity 0 \
+  --num_variable_groups 2 \
+  --variable_groups auto \
   --itr 1
 
 python -u run.py \
@@ -111,15 +84,6 @@ python -u run.py \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
-  --num_token_heads 4 \
-  --token_scales auto \
-  --use_dynamic_mask 1 \
-  --token_mask_hidden 64 \
-  --token_temperature 1.0 \
-  --view_attention_heads 4 \
-  --view_residual_init 0.0 \
-  --gate_temperature 1.0 \
-  --fusion_type dynamic \
-  --lambda_redundancy 0 \
-  --lambda_mask_diversity 0 \
+  --num_variable_groups 2 \
+  --variable_groups auto \
   --itr 1
