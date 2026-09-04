@@ -2,8 +2,8 @@ export CUDA_VISIBLE_DEVICES=0
 
 model_name=iTransformer_multihead
 
-# ETTh1 has seven variables. auto creates two strict groups:
-# [0, 1, 2, 3] and [4, 5, 6]. Use --variable_groups to override them.
+# Horizon-conditioned explicit relation heads. All seven ETTh1 variables are
+# tokens in one iTransformer; future steps dynamically route across four heads.
 python -u run.py \
   --is_training 1 \
   --root_path ./dataset/ETT-small/ \
@@ -21,10 +21,15 @@ python -u run.py \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
-  --num_variable_groups 2 \
-  --variable_groups auto \
-  --group_head_dim 0 \
-  --group_residual_init 0.1 \
+  --mh_relation_heads 4 \
+  --mh_head_dim 0 \
+  --mh_gate_dim 32 \
+  --mh_horizon_temperature 1.0 \
+  --mh_horizon_prior_strength 1.0 \
+  --mh_residual_init 0.1 \
+  --mh_exclude_self 1 \
+  --mh_diversity_loss_weight 0.01 \
+  --mh_balance_loss_weight 0.001 \
   --itr 1
 
 python -u run.py \
@@ -44,10 +49,15 @@ python -u run.py \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
-  --num_variable_groups 2 \
-  --variable_groups auto \
-  --group_head_dim 0 \
-  --group_residual_init 0.1 \
+  --mh_relation_heads 4 \
+  --mh_head_dim 0 \
+  --mh_gate_dim 32 \
+  --mh_horizon_temperature 1.0 \
+  --mh_horizon_prior_strength 1.0 \
+  --mh_residual_init 0.1 \
+  --mh_exclude_self 1 \
+  --mh_diversity_loss_weight 0.01 \
+  --mh_balance_loss_weight 0.001 \
   --itr 1
 
 python -u run.py \
@@ -67,10 +77,15 @@ python -u run.py \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
-  --num_variable_groups 2 \
-  --variable_groups auto \
-  --group_head_dim 0 \
-  --group_residual_init 0.1 \
+  --mh_relation_heads 4 \
+  --mh_head_dim 0 \
+  --mh_gate_dim 32 \
+  --mh_horizon_temperature 1.0 \
+  --mh_horizon_prior_strength 1.0 \
+  --mh_residual_init 0.1 \
+  --mh_exclude_self 1 \
+  --mh_diversity_loss_weight 0.01 \
+  --mh_balance_loss_weight 0.001 \
   --itr 1
 
 python -u run.py \
@@ -90,8 +105,13 @@ python -u run.py \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
-  --num_variable_groups 2 \
-  --variable_groups auto \
-  --group_head_dim 0 \
-  --group_residual_init 0.1 \
+  --mh_relation_heads 4 \
+  --mh_head_dim 0 \
+  --mh_gate_dim 32 \
+  --mh_horizon_temperature 1.0 \
+  --mh_horizon_prior_strength 1.0 \
+  --mh_residual_init 0.1 \
+  --mh_exclude_self 1 \
+  --mh_diversity_loss_weight 0.01 \
+  --mh_balance_loss_weight 0.001 \
   --itr 1

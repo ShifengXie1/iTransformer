@@ -111,16 +111,25 @@ if __name__ == '__main__':
                         help='weight penalizing refinements worse than the direct forecast')
     parser.add_argument('--refuture_update_loss_weight', type=float, default=0.01,
                         help='weight regularizing the scale-normalized output update')
-    # grouped-variable multi-branch iTransformer
-    parser.add_argument('--num_variable_groups', '--num_token_heads',
-                        dest='num_variable_groups', type=int, default=2,
-                        help='number of disjoint variable groups / independent iTransformer branches')
-    parser.add_argument('--variable_groups', type=str, default='auto',
-                        help="auto for balanced consecutive groups, or explicit groups such as '0,2,4;1,3,5,6'")
-    parser.add_argument('--group_head_dim', type=int, default=0,
-                        help='dimension of each explicit group head; 0 uses ceil(d_model / num_variable_groups)')
-    parser.add_argument('--group_residual_init', type=float, default=0.1,
-                        help='initial scale of the cross-group attention correction')
+    # horizon-conditioned explicit multi-head iTransformer
+    parser.add_argument('--mh_relation_heads', type=int, default=0,
+                        help='number of explicit relation heads; 0 reuses n_heads')
+    parser.add_argument('--mh_head_dim', type=int, default=0,
+                        help='dimension of each relation head; 0 uses ceil(d_model / heads)')
+    parser.add_argument('--mh_gate_dim', type=int, default=32,
+                        help='dimension of forecast-horizon embeddings and head prototypes')
+    parser.add_argument('--mh_horizon_temperature', type=float, default=1.0,
+                        help='softmax temperature for horizon-to-head routing')
+    parser.add_argument('--mh_horizon_prior_strength', type=float, default=1.0,
+                        help='strength of the ordered Gaussian horizon routing prior')
+    parser.add_argument('--mh_residual_init', type=float, default=0.1,
+                        help='initial scale of the explicit-head forecast correction')
+    parser.add_argument('--mh_exclude_self', type=int, choices=[0, 1], default=1,
+                        help='exclude each target variable from its relation-head sources')
+    parser.add_argument('--mh_diversity_loss_weight', type=float, default=0.01,
+                        help='weight discouraging identical relation attention maps')
+    parser.add_argument('--mh_balance_loss_weight', type=float, default=0.001,
+                        help='weight encouraging all heads to cover some horizons')
     parser.add_argument('--intra_layers', type=int, default=1,
                         help='strictly intra-variate masked encoder layers')
     parser.add_argument('--cross_top_k', type=int, default=3,
@@ -319,11 +328,17 @@ if __name__ == '__main__':
                     args.decomp_router_temperature,
                 )
             elif args.model == 'iTransformer_multihead':
-                setting += '_vg{}_groups{}_hd{}_ri{}'.format(
-                    args.num_variable_groups,
-                    args.variable_groups.replace(',', '-').replace(';', '_'),
-                    args.group_head_dim,
-                    args.group_residual_init,
+                relation_heads = args.mh_relation_heads or args.n_heads
+                setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
+                    relation_heads,
+                    args.mh_head_dim,
+                    args.mh_gate_dim,
+                    args.mh_horizon_temperature,
+                    args.mh_horizon_prior_strength,
+                    args.mh_residual_init,
+                    args.mh_exclude_self,
+                    args.mh_diversity_loss_weight,
+                    args.mh_balance_loss_weight,
                 )
             elif args.model == 'iTransformer_three':
                 setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
@@ -406,11 +421,17 @@ if __name__ == '__main__':
                 args.decomp_router_temperature,
             )
         elif args.model == 'iTransformer_multihead':
-            setting += '_vg{}_groups{}_hd{}_ri{}'.format(
-                args.num_variable_groups,
-                args.variable_groups.replace(',', '-').replace(';', '_'),
-                args.group_head_dim,
-                args.group_residual_init,
+            relation_heads = args.mh_relation_heads or args.n_heads
+            setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
+                relation_heads,
+                args.mh_head_dim,
+                args.mh_gate_dim,
+                args.mh_horizon_temperature,
+                args.mh_horizon_prior_strength,
+                args.mh_residual_init,
+                args.mh_exclude_self,
+                args.mh_diversity_loss_weight,
+                args.mh_balance_loss_weight,
             )
         elif args.model == 'iTransformer_three':
             setting += '_patch{}s{}_pel{}_fh{}_ref{}x{}k{}_g{}_loss{}-{}-{}-{}-{}'.format(
