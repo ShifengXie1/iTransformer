@@ -37,13 +37,22 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
-    def _add_model_auxiliary_loss(self, loss, target):
+    def _add_model_auxiliary_loss(self, loss, target, **forecast_context):
         """Use optional model-owned objectives without affecting baselines."""
+        self._last_reverse_loss = None
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         auxiliary_loss = getattr(model, 'auxiliary_loss', None)
         if auxiliary_loss is None:
             return loss
-        auxiliary = auxiliary_loss(target)
+        if getattr(model, 'auxiliary_loss_requires_forecast', False):
+            # Use gathered predictions explicitly: cached forward state would
+            # be lost on DataParallel replicas. The reverse branch runs on the
+            # primary device and backpropagates through the gathered forecast.
+            auxiliary = auxiliary_loss(target, **forecast_context)
+        else:
+            auxiliary = auxiliary_loss(target)
+        if 'reverse_loss' in auxiliary:
+            self._last_reverse_loss = auxiliary['reverse_loss'].detach().item()
         return loss + auxiliary.get('total', loss.new_zeros(()))
 
     def vali(self, vali_data, vali_loader, criterion):
@@ -122,6 +131,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
+            reverse_train_loss = []
 
             self.model.train()
             epoch_time = time.time()
@@ -153,7 +163,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
-                        loss = self._add_model_auxiliary_loss(loss, batch_y)
+                        loss = self._add_model_auxiliary_loss(
+                            loss, batch_y, history=batch_x, prediction=outputs,
+                            history_marks=batch_x_mark, future_marks=batch_y_mark,
+                        )
                         train_loss.append(loss.item())
                 else:
                     if self.args.output_attention:
@@ -165,8 +178,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
-                    loss = self._add_model_auxiliary_loss(loss, batch_y)
+                    loss = self._add_model_auxiliary_loss(
+                        loss, batch_y, history=batch_x, prediction=outputs,
+                        history_marks=batch_x_mark, future_marks=batch_y_mark,
+                    )
                     train_loss.append(loss.item())
+
+                if self._last_reverse_loss is not None:
+                    reverse_train_loss.append(self._last_reverse_loss)
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -186,6 +205,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
+            if reverse_train_loss:
+                print('Epoch: {} reverse reconstruction MSE: {:.7f}'.format(
+                    epoch + 1, np.average(reverse_train_loss)
+                ))
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 

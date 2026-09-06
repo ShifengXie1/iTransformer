@@ -25,7 +25,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, iTransformer_reverse, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -88,6 +88,11 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # iTransformer forward prediction / reverse history reconstruction
+    parser.add_argument('--reverse_loss_weight', type=float, default=0.05,
+                        help='weight of reverse history reconstruction MSE; 0 disables it')
+    parser.add_argument('--reverse_recon_len', type=int, default=0,
+                        help='number of most recent history steps to reconstruct; 0 uses seq_len')
     # iTransformer prediction-feedback fixed-point output refinement
     parser.add_argument('--refuture_splits', type=str, default='0.25,0.5,0.75',
                         help='comma-separated forecast-prefix fractions or absolute horizons')
@@ -356,6 +361,11 @@ if __name__ == '__main__':
                     args.three_refinement_loss_weight,
                     args.three_monotonic_loss_weight,
                 )
+            elif args.model == 'iTransformer_reverse':
+                setting += '_revlen{}_w{}'.format(
+                    args.reverse_recon_len or args.seq_len,
+                    args.reverse_loss_weight,
+                )
             elif args.model == 'iTransformer_refuture':
                 setting += '_rfsp{}x{}_eta{}_a{}_clip{}_d{}'.format(
                     args.refuture_splits.replace(',', '-'),
@@ -448,6 +458,11 @@ if __name__ == '__main__':
                 args.three_base_loss_weight,
                 args.three_refinement_loss_weight,
                 args.three_monotonic_loss_weight,
+            )
+        elif args.model == 'iTransformer_reverse':
+            setting += '_revlen{}_w{}'.format(
+                args.reverse_recon_len or args.seq_len,
+                args.reverse_loss_weight,
             )
         elif args.model == 'iTransformer_refuture':
             setting += '_rfsp{}x{}_eta{}_a{}_clip{}_d{}'.format(
