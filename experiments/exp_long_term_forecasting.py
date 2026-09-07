@@ -3,6 +3,7 @@ from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 from utils.periods import save_period_metadata
+from utils.reproducibility import backbone_fingerprint, tensor_fingerprint
 import torch
 import torch.nn as nn
 from torch import optim
@@ -20,6 +21,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _build_model(self):
         model = self.model_dict[self.args.model].Model(self.args).float()
+        if getattr(self.args, 'diagnose_repro', False):
+            print('Repro initial_backbone_sha256:', backbone_fingerprint(model))
 
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
@@ -56,7 +59,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return loss + auxiliary.get('total', loss.new_zeros(()))
 
     def vali(self, vali_data, vali_loader, criterion):
-        total_loss = []
+        loss_sum = 0.0
+        element_count = 0
+        was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
@@ -93,10 +98,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 loss = criterion(pred, true)
 
-                total_loss.append(loss)
-        total_loss = np.average(total_loss)
-        self.model.train()
-        return total_loss
+                # Validation keeps the smaller final batch: weight by elements.
+                loss_sum += loss.item() * pred.numel()
+                element_count += pred.numel()
+        self.model.train(was_training)
+        if element_count == 0:
+            raise ValueError('Cannot evaluate an empty data loader')
+        return loss_sum / element_count
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -137,6 +145,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             self.model.train()
             epoch_time = time.time()
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                diagnose_first = getattr(self.args, 'diagnose_repro', False) and i == 0
+                if diagnose_first:
+                    print('Repro epoch={} first_batch_sha256: {}'.format(
+                        epoch + 1, tensor_fingerprint(
+                            batch_x, batch_y, batch_x_mark, batch_y_mark
+                        )
+                    ))
                 iter_count += 1
                 model_optim.zero_grad()
                 batch_x = batch_x.float().to(self.device)
@@ -189,6 +204,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 if self._last_reverse_loss is not None:
                     reverse_train_loss.append(self._last_reverse_loss)
+                if diagnose_first:
+                    print('Repro epoch={} first_prediction_sha256: {}'.format(
+                        epoch + 1, tensor_fingerprint(outputs)
+                    ))
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -206,6 +225,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     loss.backward()
                     model_optim.step()
 
+                if diagnose_first:
+                    print('Repro epoch={} first_step_backbone_sha256: {}'.format(
+                        epoch + 1, backbone_fingerprint(self.model)
+                    ))
+
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             print('Epoch: {} forecast training MSE: {:.7f}, learning rate: {}'.format(
@@ -216,6 +240,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 print('Epoch: {} reverse reconstruction MSE: {:.7f}'.format(
                     epoch + 1, np.average(reverse_train_loss)
                 ))
+            elif getattr(self.args, 'model', '') == 'iTransformer_reverse':
+                print('Epoch: {} reverse reconstruction: disabled'.format(epoch + 1))
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
 

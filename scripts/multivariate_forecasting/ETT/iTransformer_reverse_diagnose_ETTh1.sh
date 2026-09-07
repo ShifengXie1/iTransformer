@@ -6,10 +6,25 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0}"
 python_bin=${PYTHON_BIN:-python}
 run_tag="$(date +%Y%m%d_%H%M%S)_$$"
+read -r -a seeds <<< "${SEEDS:-2023 2024 2025}"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+if (( ${#seeds[@]} == 0 )); then
+  printf 'SEEDS must contain at least one integer.\n' >&2
+  exit 1
+fi
+for seed in "${seeds[@]}"; do
+  if [[ ! "$seed" =~ ^[0-9]+$ ]]; then
+    printf 'Invalid seed: %s\n' "$seed" >&2
+    exit 1
+  fi
+done
+
+# Verify gradients/RNG isolation/validation aggregation before full training.
+"$python_bin" -m unittest discover -s tests -p test_reverse_reproducibility.py -v
 
 # Same settings as the existing ETTh1 96 -> 336 experiment.
-# Each invocation uses run.py's seed 2023. The extra reverse network consumes
-# RNG state, so equal seeds do not guarantee identical training trajectories.
+# Independent loader/reverse RNG streams and strict deterministic kernels make
+# A/C a paired equivalence check. No AMP or multi-GPU in this diagnostic.
 common_args=(
   --is_training 1
   --root_path ./dataset/ETT-small/
@@ -42,28 +57,39 @@ common_args=(
   --gpu 0
   --itr 1
   --reverse_recon_len 96
-  --des "reverse_diag_${run_tag}"
+  --deterministic 1
+  --diagnose_repro 1
+  --des "reverse_diag_rng_${run_tag}"
 )
 
 run_experiment() {
   local group=$1
   local model=$2
   local weight=$3
-  printf '\nStarting group %s: model=%s, reverse_loss_weight=%s\n' \
-    "$group" "$model" "$weight"
+  local seed=$4
+  printf '\nStarting seed=%s group=%s: model=%s, reverse_loss_weight=%s\n' \
+    "$seed" "$group" "$model" "$weight"
   "$python_bin" -u run.py "${common_args[@]}" \
     --model_id "ETTh1_96_336_diag_${group}" \
     --model "$model" \
-    --reverse_loss_weight "$weight"
+    --reverse_loss_weight "$weight" \
+    --seed "$seed"
 }
 
 # A: original baseline; B: current cycle loss; C: reverse loss disabled.
 # A ignores reverse settings. C skips reverse reconstruction during training.
 # Run sequentially on the same device. Stop immediately if any run fails.
-run_experiment A iTransformer 0
-run_experiment B iTransformer_reverse 0.05
-run_experiment C iTransformer_reverse 0
+for seed in "${seeds[@]}"; do
+  run_experiment A iTransformer 0 "$seed"
+  run_experiment C iTransformer_reverse 0 "$seed"
+  # Stop before spending time on B if the zero-weight control is not equivalent.
+  "$python_bin" utils/summarize_reverse_diagnosis.py \
+    --batch-tag "$run_tag" --seed "$seed" --check-ac
+  run_experiment B iTransformer_reverse 0.05 "$seed"
+done
+
+"$python_bin" utils/summarize_reverse_diagnosis.py --batch-tag "$run_tag"
 
 printf '\nCompleted diagnostic batch: %s\n' "$run_tag"
-printf 'Logs: logs/ (three run logs; Args include diag_A, diag_B, or diag_C).\n'
+printf 'Logs and paired summary: logs/ (three runs per seed).\n'
 printf 'Final metrics: result_long_term_forecast.txt\n'

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from model.iTransformer import Model as ITransformer
 from model.Transformer import Model as Transformer
+from utils.reproducibility import IsolatedTorchRNG
 
 
 class Model(ITransformer):
@@ -47,7 +48,12 @@ class Model(ITransformer):
         reverse_configs.c_out = self.reverse_channels
         reverse_configs.channel_independence = False
         reverse_configs.output_attention = False
-        self.reverse_model = Transformer(reverse_configs)
+        # Constructing an unused auxiliary model must not perturb baseline RNG.
+        # Parameters are initialized on CPU, before the runner moves the model.
+        with torch.random.fork_rng(devices=[]):
+            self.reverse_model = Transformer(reverse_configs)
+        seed = getattr(configs, 'run_seed', getattr(configs, 'seed', 2023))
+        self.reverse_rng = IsolatedTorchRNG((seed + 100003) % (2 ** 32))
 
     def auxiliary_loss(self, target, *, history, prediction,
                        history_marks=None, future_marks=None):
@@ -61,7 +67,8 @@ class Model(ITransformer):
         """
         zero = target.new_zeros(())
         if not self.training or self.reverse_loss_weight == 0:
-            return {'total': zero, 'reverse_loss': zero}
+            # Omit the metric: a disabled loss is not a perfect reconstruction.
+            return {'total': zero}
         if (history.ndim != 3 or prediction.ndim != 3
                 or history.shape[0] != prediction.shape[0]
                 or history.shape[1] != self.seq_len
@@ -101,9 +108,12 @@ class Model(ITransformer):
                 history_marks[:, -self.reverse_recon_len:, :].flip(1),
             ], dim=1)
 
-        reconstructed = self.reverse_model(
-            reverse_input, reverse_marks, decoder_input, decoder_marks
-        )
+        # Dropout uses an advancing private stream, retaining autograd while
+        # leaving the next forward iTransformer dropout mask unchanged.
+        with self.reverse_rng.use(reverse_input.device):
+            reconstructed = self.reverse_model(
+                reverse_input, reverse_marks, decoder_input, decoder_marks
+            )
         # Compute the reduction in FP32 under AMP while preserving gradients.
         reverse_loss = F.mse_loss(reconstructed.float(), reverse_target.float())
         return {

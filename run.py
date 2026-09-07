@@ -13,14 +13,15 @@ from utils.periods import (
 import random
 import numpy as np
 from utils.run_logging import start_run_logging
+from utils.reproducibility import seed_everything
 
 if __name__ == '__main__':
-    fix_seed = 2023
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
-
     parser = argparse.ArgumentParser(description='iTransformer')
+    parser.add_argument('--seed', type=int, default=2023, help='base random seed; itr repeats use seed + repeat index')
+    parser.add_argument('--deterministic', type=int, choices=[0, 1], default=0,
+                        help='require deterministic PyTorch operations')
+    parser.add_argument('--diagnose_repro', type=int, choices=[0, 1], default=0,
+                        help='log backbone, first-batch and first-step SHA256 checks')
 
     # basic config
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
@@ -214,13 +215,19 @@ if __name__ == '__main__':
                                                                            'you can select [partial_start_index, min(enc_in + partial_start_index, N)]')
 
     args = parser.parse_args()
+    if not 0 <= args.seed < 2 ** 32:
+        parser.error('--seed must be in [0, 2**32)')
+    args.run_seed = args.seed
     # Reuse one timestamp for every artifact produced by this process so that
     # test plots, metrics and predictions from the same run stay grouped.
     args.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     args.log_path = start_run_logging(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'), args
     )
-    print('Random seed:', fix_seed)
+    seed_everything(args.run_seed, bool(args.deterministic))
+    print('Random seed:', args.run_seed)
+    print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda,
+          'deterministic:', bool(args.deterministic))
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -296,6 +303,9 @@ if __name__ == '__main__':
 
     if args.is_training:
         for ii in range(args.itr):
+            args.run_seed = (args.seed + ii) % (2 ** 32)
+            seed_everything(args.run_seed, bool(args.deterministic))
+            print('Repeat:', ii, 'random seed:', args.run_seed)
             # setting record of experiments
             setting = '{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt{}_{}_{}'.format(
                 args.model_id,
@@ -381,6 +391,8 @@ if __name__ == '__main__':
                     args.refuture_differentiable,
                 )
 
+            if args.seed != 2023 or args.deterministic or args.diagnose_repro:
+                setting += '_seed{}'.format(args.run_seed)
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
@@ -479,6 +491,9 @@ if __name__ == '__main__':
                 args.refuture_differentiable,
             )
 
+        if args.seed != 2023 or args.deterministic or args.diagnose_repro:
+            setting += '_seed{}'.format(args.run_seed)
+        seed_everything(args.run_seed, bool(args.deterministic))
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         exp.test(setting, test=1)
