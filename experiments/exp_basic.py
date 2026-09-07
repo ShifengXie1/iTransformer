@@ -4,7 +4,7 @@ from model import Transformer, Informer, Reformer, Flowformer, Flashformer, \
     iTransformer, iInformer, iReformer, iFlowformer, iFlashformer, \
     iTransformer_fft, iTransformer_cross, iTransformer_decom, \
     iTransformer_three, iTransformer_refuture, \
-    iTransformer_multihead, iTransformer_reverse
+    iTransformer_multihead
 
 
 class Exp_Basic(object):
@@ -17,7 +17,6 @@ class Exp_Basic(object):
             'Flowformer': Flowformer,
             'Flashformer': Flashformer,
             'iTransformer': iTransformer,
-            'iTransformer_reverse': iTransformer_reverse,
             'iTransformer_fft': iTransformer_fft,
             'iTransformer_cross': iTransformer_cross,
             'iTransformer_decom': iTransformer_decom,
