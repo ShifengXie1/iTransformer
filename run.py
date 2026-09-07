@@ -14,6 +14,7 @@ import random
 import numpy as np
 from utils.run_logging import start_run_logging
 from model.itransformer_delay import delay_setting_suffix
+from model.iTransformer_pl import period_lag_setting_suffix
 
 if __name__ == '__main__':
     fix_seed = 2023
@@ -27,7 +28,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -90,6 +91,29 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # Period-component phase-lag iTransformer
+    parser.add_argument('--period_mode', choices=['fixed', 'fft'], default='fixed',
+                        help='shared fixed period or amplitude-weighted FFT period per batch')
+    parser.add_argument('--period', type=int, default=24,
+                        help='fixed period; also FFT fallback and reference projection width')
+    parser.add_argument('--min_period', type=int, default=4,
+                        help='minimum candidate period in FFT mode')
+    parser.add_argument('--max_period', type=int, default=None,
+                        help='maximum candidate period in FFT mode; defaults to seq_len')
+    parser.add_argument('--period_sigma', type=float, default=1.5,
+                        help='Gaussian tolerance for amplitude-weighted period consensus')
+    parser.add_argument('--harmonic_max_bin', type=int, default=4,
+                        help='highest harmonic bin; 1 disables the harmonic band')
+    parser.add_argument('--max_lag', type=float, default=None,
+                        help='positive scale of lag features; defaults to period, does not clip lag')
+    parser.add_argument('--lag_alpha', type=float, default=0.1,
+                        help='initial learnable cross-spectrum strength bias scale')
+    parser.add_argument('--lag_beta', type=float, default=0.1,
+                        help='initial learnable phase-lag bias scale')
+    parser.add_argument('--component_temporal_mixer', choices=['conv', 'linear', 'none'], default='conv',
+                        help='patch mixer before attention pooling')
+    parser.add_argument('--use_adaptive_fusion', type=int, choices=[0, 1], default=1,
+                        help='learn variable-specific component weights; 0 uses uniform weights')
     # iTransformer prediction-feedback fixed-point output refinement
     parser.add_argument('--refuture_splits', type=str, default='0.25,0.5,0.75',
                         help='comma-separated forecast-prefix fractions or absolute horizons')
@@ -295,7 +319,9 @@ if __name__ == '__main__':
                 args.distil,
                 args.des,
                 args.class_strategy, ii)
-            if args.model == 'iTransformer_fft':
+            if args.model == 'iTransformer_pl':
+                setting += period_lag_setting_suffix(args)
+            elif args.model == 'iTransformer_fft':
                 setting += '_cp{}_xp{}_linearhead'.format(
                     '-'.join(map(str, args.channel_periods)),
                     args.cross_period,
@@ -381,7 +407,9 @@ if __name__ == '__main__':
             args.distil,
             args.des,
             args.class_strategy, ii)
-        if args.model == 'iTransformer_fft':
+        if args.model == 'iTransformer_pl':
+            setting += period_lag_setting_suffix(args)
+        elif args.model == 'iTransformer_fft':
             setting += '_cp{}_xp{}_linearhead'.format(
                 '-'.join(map(str, args.channel_periods)),
                 args.cross_period,
