@@ -131,6 +131,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
+            forecast_train_loss = []
             reverse_train_loss = []
 
             self.model.train()
@@ -163,6 +164,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
+                        forecast_train_loss.append(loss.detach().item())
                         loss = self._add_model_auxiliary_loss(
                             loss, batch_y, history=batch_x, prediction=outputs,
                             history_marks=batch_x_mark, future_marks=batch_y_mark,
@@ -178,6 +180,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
+                    forecast_train_loss.append(loss.detach().item())
                     loss = self._add_model_auxiliary_loss(
                         loss, batch_y, history=batch_x, prediction=outputs,
                         history_marks=batch_x_mark, future_marks=batch_y_mark,
@@ -205,6 +208,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
+            print('Epoch: {} forecast training MSE: {:.7f}, learning rate: {}'.format(
+                epoch + 1, np.average(forecast_train_loss),
+                model_optim.param_groups[0]['lr'],
+            ))
             if reverse_train_loss:
                 print('Epoch: {} reverse reconstruction MSE: {:.7f}'.format(
                     epoch + 1, np.average(reverse_train_loss)

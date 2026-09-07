@@ -12,6 +12,7 @@ from utils.periods import (
 )
 import random
 import numpy as np
+from utils.run_logging import start_run_logging
 
 if __name__ == '__main__':
     fix_seed = 2023
@@ -216,6 +217,10 @@ if __name__ == '__main__':
     # Reuse one timestamp for every artifact produced by this process so that
     # test plots, metrics and predictions from the same run stay grouped.
     args.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    args.log_path = start_run_logging(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'), args
+    )
+    print('Random seed:', fix_seed)
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
