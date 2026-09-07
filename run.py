@@ -13,6 +13,7 @@ from utils.periods import (
 import random
 import numpy as np
 from utils.run_logging import start_run_logging
+from model.itransformer_delay import delay_setting_suffix
 
 if __name__ == '__main__':
     fix_seed = 2023
@@ -26,7 +27,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -172,6 +173,19 @@ if __name__ == '__main__':
     parser.add_argument('--decomp_moving_avg', type=int, default=25,
                         help='positive odd trend window for dual-branch iTransformer; '
                              'd_model/d_ff/e_layers/n_heads configure each branch')
+    parser.add_argument('--delay_mode', choices=['component', 'raw', 'off'], default='component',
+                        help='lag guidance: separate trend/residual, raw history, or disabled')
+    parser.add_argument('--delay_lags', type=str, default='0,1,2,4,8,12,24',
+                        help='comma-separated nonnegative source delays, measured in input steps')
+    parser.add_argument('--delay_context_len', type=int, default=0,
+                        help='equal-length lag comparison window; 0 uses seq_len-max(lags); '
+                             'keep fixed for zero-lag ablations')
+    parser.add_argument('--delay_hidden', type=int, default=32,
+                        help='dimension of lightweight lag queries, keys and values')
+    parser.add_argument('--delay_moving_avg', type=int, default=25,
+                        help='positive odd centered trend window, used only for relation guidance')
+    parser.add_argument('--delay_gate_init', type=float, default=0.02,
+                        help='initial tanh gate value for each lag guide, in [0, 1)')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
@@ -294,6 +308,8 @@ if __name__ == '__main__':
                 )
             elif args.model == 'iTransformer_decom':
                 setting += '_dual_ma{}'.format(args.decomp_moving_avg)
+            elif args.model == 'itransformer_delay':
+                setting += delay_setting_suffix(args)
             elif args.model == 'iTransformer_multihead':
                 relation_heads = args.mh_relation_heads or args.n_heads
                 setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
@@ -378,6 +394,8 @@ if __name__ == '__main__':
             )
         elif args.model == 'iTransformer_decom':
             setting += '_dual_ma{}'.format(args.decomp_moving_avg)
+        elif args.model == 'itransformer_delay':
+            setting += delay_setting_suffix(args)
         elif args.model == 'iTransformer_multihead':
             relation_heads = args.mh_relation_heads or args.n_heads
             setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
