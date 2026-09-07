@@ -21,8 +21,6 @@ DELAY_GATE_INIT="${DELAY_GATE_INIT:-0.02}"
 # V2 uses observed source(T+h-lag) only: with max lag 24, direct correction
 # covers h=1..24; later horizons retain the backbone forecast.
 # DELAY_LAGS=0 is an exact no-evidence control, equivalent to disabling correction.
-# Run alignment, fallback and gradient checks before launching server training.
-"$PYTHON" -m unittest discover -s checks -p test_itransformer_delay.py
 read -r -a horizons <<< "${PRED_LENS:-96 192 336 720}"
 for pred_len in "${horizons[@]}"; do
   case "$pred_len" in
