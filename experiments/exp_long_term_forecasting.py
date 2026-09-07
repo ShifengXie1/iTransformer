@@ -46,8 +46,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         auxiliary = auxiliary_loss(target)
         return loss + auxiliary.get('total', loss.new_zeros(()))
 
-    def vali(self, vali_data, vali_loader, criterion):
+    def vali(self, vali_data, vali_loader, criterion, diagnostic_label='validation'):
         total_loss = []
+        delay_totals = {}
+        delay_samples = 0
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
@@ -75,6 +77,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                # Scalar diagnostics require no attention tensors or extra pass.
+                # DataParallel replicas do not persist Python-side summaries.
+                delay_metrics = getattr(self.model, 'delay_metrics', None)
+                if delay_metrics is not None:
+                    batch_count = batch_x.size(0)
+                    delay_samples += batch_count
+                    for name, value in delay_metrics.items():
+                        delay_totals[name] = delay_totals.get(name, 0) + value.detach() * batch_count
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -86,6 +96,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 total_loss.append(loss)
         total_loss = np.average(total_loss)
+        if delay_samples:
+            summary = {name: (value / delay_samples).item() for name, value in delay_totals.items()}
+            print('Delay {}: {}'.format(diagnostic_label, ' '.join(
+                '{}={:.6g}'.format(name, value) for name, value in summary.items())))
         self.model.train()
         return total_loss
 
@@ -187,7 +201,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion, diagnostic_label='test')
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))

@@ -174,18 +174,18 @@ if __name__ == '__main__':
                         help='positive odd trend window for dual-branch iTransformer; '
                              'd_model/d_ff/e_layers/n_heads configure each branch')
     parser.add_argument('--delay_mode', choices=['component', 'raw', 'off'], default='component',
-                        help='lag guidance: separate trend/residual, raw history, or disabled')
+                        help='observed-leader correction: separate trend/residual, raw history, or disabled')
     parser.add_argument('--delay_lags', type=str, default='0,1,2,4,8,12,24',
-                        help='comma-separated nonnegative source delays, measured in input steps')
+                        help='nonnegative source delays; only h<=lag has observed evidence; lag=0 gives no correction')
     parser.add_argument('--delay_context_len', type=int, default=0,
                         help='equal-length lag comparison window; 0 uses seq_len-max(lags); '
-                             'keep fixed for zero-lag ablations')
+                             'must be >=2; keep fixed across ablations')
     parser.add_argument('--delay_hidden', type=int, default=32,
-                        help='dimension of lightweight lag queries, keys and values')
+                        help='hidden dimension of sample/target-specific component gates')
     parser.add_argument('--delay_moving_avg', type=int, default=25,
-                        help='positive odd centered trend window, used only for relation guidance')
+                        help='positive odd causal moving-average window for component relations and values')
     parser.add_argument('--delay_gate_init', type=float, default=0.02,
-                        help='initial tanh gate value for each lag guide, in [0, 1)')
+                        help='initial sigmoid gate value in (0, 1); use delay_mode=off to disable')
     parser.add_argument('--target_root_path', type=str, default='./data/electricity/', help='root path of the data file')
     parser.add_argument('--target_data_path', type=str, default='electricity.csv', help='data file')
     parser.add_argument('--efficient_training', type=bool, default=False, help='whether to use efficient_training (exp_name should be partial train)') # See Figure 8 of our paper for the detail
