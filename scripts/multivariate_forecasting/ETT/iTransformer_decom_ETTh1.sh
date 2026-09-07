@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES=0
+export OMP_NUM_THREADS=10
 
 # Run from any directory; run.py already records training output under logs/.
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
