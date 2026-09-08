@@ -142,3 +142,6 @@ TimeMixer-main/
 PatchTST-main/
 others/
 tests/
+.*/
+checks/
+docs/

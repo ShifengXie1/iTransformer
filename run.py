@@ -14,6 +14,7 @@ import random
 import numpy as np
 from utils.run_logging import start_run_logging
 from model.itransformer_delay import delay_setting_suffix
+from model.itransformer_correlation import correlation_setting_suffix
 
 if __name__ == '__main__':
     fix_seed = 2023
@@ -27,7 +28,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, itransformer_correlation, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -90,6 +91,16 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # Fixed training-label temporal/variate PCA alignment
+    parser.add_argument('--lambda_joint', type=float, default=0.1)
+    parser.add_argument('--alignment_mode', choices=['none', 'temporal', 'variate', 'joint'], default='joint')
+    parser.add_argument('--temporal_keep_ratio', type=float, default=0.5,
+                        help='retained temporal PCA fraction in (0, 1)')
+    parser.add_argument('--variate_keep_ratio', type=float, default=0.5,
+                        help='retained variate PCA fraction in (0, 1)')
+    parser.add_argument('--joint_weighting', choices=['sqrt_eigen_product'], default='sqrt_eigen_product')
+    parser.add_argument('--correlation_eps', type=float, default=1e-6)
+    parser.add_argument('--corr_standardize_labels', type=int, choices=[0, 1], default=1)
     # iTransformer prediction-feedback fixed-point output refinement
     parser.add_argument('--refuture_splits', type=str, default='0.25,0.5,0.75',
                         help='comma-separated forecast-prefix fractions or absolute horizons')
@@ -310,6 +321,8 @@ if __name__ == '__main__':
                 setting += '_dual_ma{}'.format(args.decomp_moving_avg)
             elif args.model == 'itransformer_delay':
                 setting += delay_setting_suffix(args)
+            elif args.model == 'itransformer_correlation':
+                setting += correlation_setting_suffix(args)
             elif args.model == 'iTransformer_multihead':
                 relation_heads = args.mh_relation_heads or args.n_heads
                 setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
@@ -396,6 +409,8 @@ if __name__ == '__main__':
             setting += '_dual_ma{}'.format(args.decomp_moving_avg)
         elif args.model == 'itransformer_delay':
             setting += delay_setting_suffix(args)
+        elif args.model == 'itransformer_correlation':
+            setting += correlation_setting_suffix(args)
         elif args.model == 'iTransformer_multihead':
             relation_heads = args.mh_relation_heads or args.n_heads
             setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(

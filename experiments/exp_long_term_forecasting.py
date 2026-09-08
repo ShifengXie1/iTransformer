@@ -3,6 +3,7 @@ from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 from utils.periods import save_period_metadata
+from model.itransformer_correlation import initialize_correlation_basis
 import torch
 import torch.nn as nn
 from torch import optim
@@ -37,9 +38,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
-    def _add_model_auxiliary_loss(self, loss, target):
+    def _add_model_auxiliary_loss(self, loss, target, pred=None):
         """Use optional model-owned objectives without affecting baselines."""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        correlation_loss = getattr(model, 'compute_correlation_loss', None)
+        if correlation_loss is not None and model.lambda_joint > 0:
+            loss = loss + model.lambda_joint * correlation_loss(pred, target)
         auxiliary_loss = getattr(model, 'auxiliary_loss', None)
         if auxiliary_loss is None:
             return loss
@@ -105,6 +109,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
+        if self.args.model == 'itransformer_correlation':
+            print('Initializing fixed correlation bases from training forecast labels...')
+            initialize_correlation_basis(self.model, train_loader)
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
 
@@ -167,7 +174,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
-                        loss = self._add_model_auxiliary_loss(loss, batch_y)
+                        loss = self._add_model_auxiliary_loss(loss, batch_y, outputs)
                         train_loss.append(loss.item())
                 else:
                     if self.args.output_attention:
@@ -179,7 +186,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
-                    loss = self._add_model_auxiliary_loss(loss, batch_y)
+                    loss = self._add_model_auxiliary_loss(loss, batch_y, outputs)
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
