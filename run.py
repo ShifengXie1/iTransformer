@@ -94,7 +94,7 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
-    # Variable-wise historical retrieval before inter-variable attention
+    # Variable-wise past retrieval and future fusion in prediction space
     parser.add_argument('--use_retrieval', type=int, choices=[0, 1], default=1)
     parser.add_argument('--retrieval_top_k', type=int, default=8)
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)
@@ -102,8 +102,10 @@ if __name__ == '__main__':
     parser.add_argument('--retrieval_stride', type=int, default=1)
     parser.add_argument('--retrieval_chunk_size', type=int, default=128)
     parser.add_argument('--retrieval_variable_chunk_size', type=int, default=32)
-    parser.add_argument('--retrieval_use_future', type=int, choices=[0, 1], default=1)
-    parser.add_argument('--retrieval_use_gate', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--retrieval_use_future', type=int, choices=[0, 1], default=1,
+                        help='fuse retrieved future predictions; 0 recovers the original backbone')
+    parser.add_argument('--retrieval_use_gate', type=int, choices=[0, 1], default=1,
+                        help='learn horizon-wise prediction gates; 0 uses retrieved forecasts when available')
     parser.add_argument('--retrieval_weighted', type=int, choices=[0, 1], default=1)
     # Context-conditioned low-rank output calibration
     parser.add_argument('--calibration_rank', type=int, default=8)

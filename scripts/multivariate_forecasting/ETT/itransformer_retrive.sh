@@ -8,8 +8,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 # Historical pairs come only from the training split. Training sample indices
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
 # PRED_LENS="96 192 336 720" runs all horizons. Defaults to one experiment.
-# USE_RETRIEVAL=0: baseline; RETRIEVAL_USE_FUTURE=0: past-only values;
-# RETRIEVAL_USE_GATE=0: additive fusion; RETRIEVAL_WEIGHTED=0: uniform Top-K.
+# Past embeddings select neighbors; historical futures fuse with Y_base in
+# prediction space. Y_pred = Y_base + gate * (Y_ret - Y_base).
+# USE_RETRIEVAL=0 or RETRIEVAL_USE_FUTURE=0: original backbone;
+# RETRIEVAL_USE_GATE=0: retrieved forecast wherever history is available;
+# RETRIEVAL_WEIGHTED=0: uniform Top-K. No history always uses the backbone.
 PYTHON="${PYTHON:-python}"
 read -r -a horizons <<< "${PRED_LENS:-96}"
 for pred_len in "${horizons[@]}"; do
@@ -38,5 +41,5 @@ for pred_len in "${horizons[@]}"; do
     --retrieval_weighted "${RETRIEVAL_WEIGHTED:-1}" \
     --dropout 0.1 --batch_size 32 --train_epochs 10 --patience 3 \
     --learning_rate 0.0001 --lradj type1 --use_norm 1 \
-    --des VariableWiseRetrieval --itr 1
+    --des VariableWisePredictionFusion --itr 1
 done

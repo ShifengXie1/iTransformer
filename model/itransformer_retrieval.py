@@ -1,8 +1,16 @@
-"""VR-iTransformer: variable-wise historical retrieval before self-attention.
+"""VR-iTransformer: variable-wise retrieval with prediction-space fusion.
 
 Each variable independently retrieves the same variable's historical (X, Y)
-pairs, softmax-aggregates their representations, and gates the result into its
-current token. Timestamp tokens do not query the memory.
+pairs using past embeddings. The original iTransformer produces Y_base;
+weighted historical futures produce Y_ret. A horizon-wise gate conditioned
+on the current past token and retrieval similarity combines the predictions:
+
+    Y_pred = Y_base + sigmoid(MLP([z, similarity])) * (Y_ret - Y_base)
+
+Historical futures never enter the embedding or self-attention. With use_norm,
+each historical future uses its own past's mean/std and is transferred to the
+current query's scale by the final de-normalization. No eligible history means
+exactly Y_base. Timestamp tokens do not query the memory.
 
 Usage outside the experiment runner::
 
@@ -18,6 +26,7 @@ with current embedding weights, so optimizer updates cannot leave stale keys.
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -25,6 +34,13 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from model.iTransformer import Model as OriginalITransformer
+
+
+class RetrievedFuture(NamedTuple):
+    future: torch.Tensor      # [B,N,H], in normalized past units if use_norm
+    indices: torch.Tensor     # [B,N,K], positions in memory_starts; -1 is invalid
+    weights: torch.Tensor     # [B,N,K], zero for invalid neighbors
+    similarity: torch.Tensor  # [B,N,1], weighted cosine similarity
 
 
 class Model(OriginalITransformer):
@@ -48,11 +64,14 @@ class Model(OriginalITransformer):
             raise ValueError('retrieval_temperature must be finite and positive')
 
         d_model = configs.d_model
-        self.future_embedding = nn.Linear(self.pred_len, d_model)
-        self.retrieval_value = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU())
-        self.retrieval_gate = nn.Linear(2 * d_model, d_model)
-        nn.init.zeros_(self.retrieval_gate.weight)
-        nn.init.constant_(self.retrieval_gate.bias, -2.0)
+        # Learn reliability in prediction space: one gate per variable/horizon.
+        # Nonzero final weights let both MLP layers learn from the first step.
+        self.prediction_gate = nn.Sequential(
+            nn.Linear(d_model + 1, d_model), nn.GELU(),
+            nn.Linear(d_model, self.pred_len),
+        )
+        nn.init.normal_(self.prediction_gate[-1].weight, std=0.02)
+        nn.init.constant_(self.prediction_gate[-1].bias, -2.0)
         self.register_buffer('memory_series', torch.empty(0, 0))
         self.register_buffer('memory_starts', torch.empty(0, dtype=torch.long))
         self.register_buffer('memory_mean', torch.empty(0))
@@ -159,11 +178,12 @@ class Model(OriginalITransformer):
         return best_indices, torch.isfinite(best_scores)
 
     def retrieve(self, query_tokens, query_end=None):
-        """Return retrieval tokens [B,N,D], indices and weights [B,N,K].
+        """Return future [B,N,H], indices/weights [B,N,K], similarity [B,N,1].
 
         Invalid neighbors have index -1 and weight zero. The discrete Top-K
-        search has no gradient; selected keys, similarity weights and values
-        are recomputed with gradients. Pass pre-dropout variable embeddings.
+        search has no gradient; selected keys and similarity weights are
+        recomputed with gradients. Values are observed historical futures,
+        without a future-to-token projection. Pass pre-dropout past embeddings.
         """
         if not self.memory_starts.numel():
             raise RuntimeError('Retrieval memory is empty; call build_memory(train_series) first')
@@ -181,7 +201,7 @@ class Model(OriginalITransformer):
             projection = self.enc_embedding.value_embedding
             version = (projection.weight._version, projection.bias._version,
                        self.memory_series._version, self.memory_starts._version,
-                       query_tokens.device, projection.weight.dtype)
+                       query_tokens.device, projection.weight.dtype, self.use_norm)
             if self.training:
                 self._key_cache = None
             elif self._key_cache is None or self._key_cache_version != version:
@@ -193,7 +213,7 @@ class Model(OriginalITransformer):
                         for start in range(0, self.memory_starts.numel(), self.retrieval_chunk_size)
                     ], dim=0)
                 self._key_cache_version = version
-            representations, all_indices, all_weights = [], [], []
+            futures, all_indices, all_weights, similarities = [], [], [], []
             for first in range(0, query_tokens.size(1), self.retrieval_variable_chunk_size):
                 last = min(first + self.retrieval_variable_chunk_size, query_tokens.size(1))
                 query = query_tokens[:, first:last].float()
@@ -210,17 +230,32 @@ class Model(OriginalITransformer):
                     weights = logits.softmax(-1) * valid
                 else:
                     weights = valid.float() / valid.sum(-1, keepdim=True).clamp_min(1)
-                future_token = (self.future_embedding(future) if self.retrieval_use_future
-                                else torch.zeros_like(past_token))
-                values = self.retrieval_value(torch.cat((past_token, future_token), dim=-1))
-                representations.append((weights.unsqueeze(-1) * values).sum(2))
+                futures.append((weights.unsqueeze(-1) * future).sum(2))
+                similarities.append((weights * scores).sum(-1, keepdim=True))
                 all_indices.append(indices.masked_fill(~valid, -1))
                 all_weights.append(weights)
-            return (torch.cat(representations, dim=1), torch.cat(all_indices, dim=1),
-                    torch.cat(all_weights, dim=1))
+            return RetrievedFuture(torch.cat(futures, dim=1), torch.cat(all_indices, dim=1),
+                                   torch.cat(all_weights, dim=1), torch.cat(similarities, dim=1))
+
+    def fuse_prediction(self, base_prediction, current_tokens, retrieved):
+        """Fuse [B,N,H] forecasts in the same units, with [B,N,D] past tokens.
+
+        Delta is Y_ret - Y_base, so gates near 0 recover the backbone and
+        gates near 1 trust the retrieved forecast. Disabling the gate uses
+        Y_ret wherever history is available. Unavailable history always
+        retains the backbone, including when the gate network has biases.
+        """
+        if self.retrieval_use_gate:
+            context = torch.cat((current_tokens, retrieved.similarity.to(current_tokens.dtype)), dim=-1)
+            gate = torch.sigmoid(self.prediction_gate(context))
+        else:
+            gate = 1.0
+        prediction = base_prediction + gate * (retrieved.future - base_prediction)
+        available = (retrieved.indices >= 0).any(-1, keepdim=True)
+        return torch.where(available, prediction, base_prediction)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec, query_end=None):
-        if not self.use_retrieval:
+        if not self.use_retrieval or not self.retrieval_use_future:
             return super().forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
         if x_enc.ndim != 3 or x_enc.size(1) != self.seq_len:
             raise ValueError('x_enc must have shape [B,seq_len,N]')
@@ -239,15 +274,11 @@ class Model(OriginalITransformer):
         # and queries for selecting historical cases during training.
         tokens = self.enc_embedding.value_embedding(inputs)
         encoded = self.enc_embedding.dropout(tokens)
-        retrieval, _, _ = self.retrieve(tokens[:, :variables], query_end)
-        retrieval = retrieval.to(encoded.dtype)
-        current = encoded[:, :variables]
-        gate = (torch.sigmoid(self.retrieval_gate(torch.cat((current, retrieval), dim=-1)))
-                if self.retrieval_use_gate else 1.0)
-        enhanced = current + gate * retrieval
-        encoded = torch.cat((enhanced, encoded[:, variables:]), dim=1)
+        retrieved = self.retrieve(tokens[:, :variables], query_end)
+        # Only the current window and its covariates enter self-attention.
         encoded, attention = self.encoder(encoded, attn_mask=None)
-        prediction = self.projector(encoded).permute(0, 2, 1)[:, :, :variables]
+        base_prediction = self.projector(encoded)[:, :variables]
+        prediction = self.fuse_prediction(base_prediction, tokens[:, :variables], retrieved).permute(0, 2, 1)
         if self.use_norm:
             prediction = prediction * stdev + means
         return prediction, attention
@@ -273,7 +304,7 @@ class _IndexedTrainingDataset(Dataset):
 def initialize_retrieval_memory(model, dataset, loader):
     """Build from train data_x only; preserve the loader's sampling policy."""
     model = model.module if isinstance(model, nn.DataParallel) else model
-    if not isinstance(model, Model) or not model.use_retrieval:
+    if not isinstance(model, Model) or not model.use_retrieval or not model.retrieval_use_future:
         return loader
     model.build_memory(dataset.data_x)
     if dataset.scale:
@@ -290,7 +321,8 @@ def initialize_retrieval_memory(model, dataset, loader):
 def align_retrieval_prediction_data(model, dataset):
     """Dataset_Pred fits its own scaler; use the memory's training units instead."""
     model = model.module if isinstance(model, nn.DataParallel) else model
-    if not isinstance(model, Model) or not model.use_retrieval or not dataset.scale:
+    if (not isinstance(model, Model) or not model.use_retrieval
+            or not model.retrieval_use_future or not dataset.scale):
         return
     if not model.memory_mean.numel():
         raise RuntimeError('Prediction requires the training scaler stored with the memory')
@@ -303,10 +335,10 @@ def align_retrieval_prediction_data(model, dataset):
 
 
 def retrieval_setting_suffix(configs):
-    """Distinguish retrieval hyperparameters and ablations in checkpoints."""
+    """Separate prediction-fusion checkpoints from the old token-fusion model."""
     defaults = [('use_retrieval', 1), ('retrieval_top_k', 8),
                 ('retrieval_temperature', 0.1), ('retrieval_memory_size', 1024),
                 ('retrieval_stride', 1), ('retrieval_use_future', 1),
                 ('retrieval_use_gate', 1), ('retrieval_weighted', 1)]
-    return '_vr{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}'.format(
+    return '_vrpred{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}'.format(
         *(getattr(configs, name, default) for name, default in defaults))
