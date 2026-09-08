@@ -9,7 +9,10 @@ import math
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, IterableDataset, Subset
+from torch.utils.data import (
+    BatchSampler, DataLoader, IterableDataset, RandomSampler, SequentialSampler,
+    Subset, SubsetRandomSampler,
+)
 
 from model.iTransformer import Model as OriginalITransformer
 
@@ -56,6 +59,8 @@ class JointCorrelationProjector(nn.Module):
 
     Ratios are strictly between 0 and 1 to keep the objective truncated.
     A singleton axis necessarily retains its only component.
+    Variates with training variance <= eps and PCA directions with eigenvalue
+    <= eps contribute no auxiliary penalty; forecast MSE still trains them.
     """
 
     def __init__(self, configs):
@@ -114,8 +119,10 @@ class JointCorrelationProjector(nn.Module):
     def initialize(self, train_loader):
         """Fit once from a map-style training DataLoader, including its tail.
 
-        A dedicated sequential loader covers the same training dataset in both
+        A dedicated sequential loader covers the same training selection in both
         passes, even if the optimization loader shuffles or drops its last batch.
+        SubsetRandomSampler indices are preserved. Other restricted/weighted or
+        custom batch samplers must be expressed as an explicit dataset Subset.
         Custom datasets must contain training labels only and be deterministic.
         """
         if self.initialized.item() or self.alignment_mode == 'none':
@@ -131,6 +138,24 @@ class JointCorrelationProjector(nn.Module):
         if getattr(split_dataset, 'set_type', 0) != 0 or getattr(
                 split_dataset, 'flag', 'train') != 'train':
             raise ValueError('Correlation basis must be initialized from the training split only')
+        if train_loader.batch_size is None or type(train_loader.batch_sampler) is not BatchSampler:
+            raise ValueError('Correlation initialization requires the standard batch sampler; '
+                             'express the training selection as a dataset Subset')
+        sampler = train_loader.sampler
+        if type(sampler) is SubsetRandomSampler:
+            # Snapshot the selection without drawing random samples or reading
+            # labels outside the sampler's indices. Reuse it for both passes.
+            dataset = Subset(dataset, list(sampler.indices))
+        elif type(sampler) is RandomSampler:
+            if sampler.replacement or sampler.num_samples != len(dataset):
+                raise ValueError('Correlation initialization does not support replacement or '
+                                 'partial random sampling; use a dataset Subset')
+        elif type(sampler) is SequentialSampler:
+            if len(sampler) != len(dataset):
+                raise ValueError('Partial sequential sampling is unsupported; use a dataset Subset')
+        else:
+            raise ValueError('Unsupported correlation sampler; use a dataset Subset or '
+                             'SubsetRandomSampler to specify the training selection')
         loader = DataLoader(dataset, batch_size=train_loader.batch_size or 32,
                             shuffle=False, drop_last=False, num_workers=0,
                             collate_fn=train_loader.collate_fn,
@@ -140,11 +165,14 @@ class JointCorrelationProjector(nn.Module):
             moments.update(labels.reshape(-1, self.n_variables))
         mean = moments.mean.reshape(1, 1, -1)
         std = moments.covariance().clamp_min(self.eps).sqrt().reshape(1, 1, -1)
+        active = std > math.sqrt(self.eps)
+        safe_std = torch.where(active, std, torch.ones_like(std))
         temporal = _StreamingMoments(self.pred_len)
         variate = _StreamingMoments(self.n_variables)
         for labels in self._training_labels(loader):
             if self.standardize_labels:
-                labels = (labels - mean) / std
+                labels = (labels - mean) / safe_std
+            labels = labels.masked_fill(~active, 0)
             temporal.update(labels.transpose(1, 2).reshape(-1, self.pred_len))
             variate.update(labels.reshape(-1, self.n_variables))
         for name, stats in (('temporal', temporal), ('variate', variate)):
@@ -171,6 +199,22 @@ class JointCorrelationProjector(nn.Module):
             values = torch.matmul(values, self.variate_basis.float())
         return values
 
+    def _prepare_values(self, values, center=False):
+        # Derive the mask from the existing std buffer so older checkpoints
+        # retain their state_dict format. Avoid dividing inactive channels by
+        # sqrt(eps), which would amplify their errors before masking.
+        std = self.label_std.float()
+        active = std > math.sqrt(self.eps)
+        if self.standardize_labels:
+            if center:
+                values = values - self.label_mean.float()
+            values = values / torch.where(active, std, torch.ones_like(std))
+        return values.masked_fill(~active, 0)
+
+    def _eigen_weights(self, eigenvalues):
+        eigenvalues = eigenvalues.float()
+        return (eigenvalues + self.eps).sqrt().masked_fill(eigenvalues <= self.eps, 0)
+
     def project(self, labels):
         """Project [B,T,N] labels in the fitted coordinate system (float32)."""
         self._check_shape(labels)
@@ -178,9 +222,7 @@ class JointCorrelationProjector(nn.Module):
             return labels
         self._require_initialized()
         with torch.autocast(device_type=labels.device.type, enabled=False):
-            values = labels.float()
-            if self.standardize_labels:
-                values = (values - self.label_mean.float()) / self.label_std.float()
+            values = self._prepare_values(labels.float(), center=True)
             return self._project(values)
 
     def forward(self, pred, true):
@@ -193,18 +235,20 @@ class JointCorrelationProjector(nn.Module):
         # Keep PCA matmuls and the weighted reduction in float32 under AMP.
         with torch.autocast(device_type=pred.device.type, enabled=False):
             error = pred.float() - true.float()
-            if self.standardize_labels:
-                error = error / self.label_std.float()  # shared label mean cancels
+            error = self._prepare_values(error)  # shared label mean cancels
             error = self._project(error)
-            wt = (self.temporal_eigenvalues.float() + self.eps).sqrt()
-            wn = (self.variate_eigenvalues.float() + self.eps).sqrt()
+            wt = self._eigen_weights(self.temporal_eigenvalues)
+            wn = self._eigen_weights(self.variate_eigenvalues)
             if self.alignment_mode == 'temporal':
                 weights = wt[:, None]
             elif self.alignment_mode == 'variate':
                 weights = wn[None, :]
             else:
                 weights = torch.outer(wt, wn)
-            weights = weights / weights.mean()
+            mean_weight = weights.mean()
+            # A zero-rank basis yields a differentiable zero auxiliary loss.
+            weights = weights / torch.where(mean_weight > 0, mean_weight,
+                                             torch.ones_like(mean_weight))
             return (weights * error.square()).mean()
 
 

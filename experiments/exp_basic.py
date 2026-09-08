@@ -4,11 +4,7 @@ from model import Transformer, Informer, Reformer, Flowformer, Flashformer, \
     iTransformer, iInformer, iReformer, iFlowformer, iFlashformer, \
     iTransformer_fft, iTransformer_cross, iTransformer_decom, \
     iTransformer_three, iTransformer_refuture, \
-<<<<<<< HEAD
-    iTransformer_multihead, itransformer_delay, itransformer_correlation
-=======
-    iTransformer_multihead, itransformer_delay, iTransformer_pl
->>>>>>> 5ee926102836868e48fc94892f722fe87839229f
+    iTransformer_multihead, itransformer_delay, itransformer_correlation, iTransformer_pl
 
 
 class Exp_Basic(object):
