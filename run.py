@@ -16,6 +16,7 @@ from utils.run_logging import start_run_logging
 from model.itransformer_delay import delay_setting_suffix
 from model.itransformer_correlation import correlation_setting_suffix
 from model.itransformer_calibration import calibration_setting_suffix
+from model.itransformer_retrieval import retrieval_setting_suffix
 from model.iTransformer_pl import period_lag_setting_suffix
 
 if __name__ == '__main__':
@@ -30,7 +31,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, itransformer_calibration, itransformer_correlation, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, itransformer_retrieval, itransformer_calibration, itransformer_correlation, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -93,6 +94,17 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # Variable-wise historical retrieval before inter-variable attention
+    parser.add_argument('--use_retrieval', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--retrieval_top_k', type=int, default=8)
+    parser.add_argument('--retrieval_temperature', type=float, default=0.1)
+    parser.add_argument('--retrieval_memory_size', type=int, default=1024)
+    parser.add_argument('--retrieval_stride', type=int, default=1)
+    parser.add_argument('--retrieval_chunk_size', type=int, default=128)
+    parser.add_argument('--retrieval_variable_chunk_size', type=int, default=32)
+    parser.add_argument('--retrieval_use_future', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--retrieval_use_gate', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--retrieval_weighted', type=int, choices=[0, 1], default=1)
     # Context-conditioned low-rank output calibration
     parser.add_argument('--calibration_rank', type=int, default=8)
     parser.add_argument('--calibration_hidden', type=int, default=32)
@@ -362,6 +374,8 @@ if __name__ == '__main__':
                 setting += correlation_setting_suffix(args)
             elif args.model == 'itransformer_calibration':
                 setting += calibration_setting_suffix(args)
+            elif args.model == 'itransformer_retrieval':
+                setting += retrieval_setting_suffix(args)
             elif args.model == 'iTransformer_multihead':
                 relation_heads = args.mh_relation_heads or args.n_heads
                 setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
@@ -454,6 +468,8 @@ if __name__ == '__main__':
             setting += correlation_setting_suffix(args)
         elif args.model == 'itransformer_calibration':
             setting += calibration_setting_suffix(args)
+        elif args.model == 'itransformer_retrieval':
+            setting += retrieval_setting_suffix(args)
         elif args.model == 'iTransformer_multihead':
             relation_heads = args.mh_relation_heads or args.n_heads
             setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
