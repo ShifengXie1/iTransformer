@@ -15,6 +15,7 @@ import numpy as np
 from utils.run_logging import start_run_logging
 from model.itransformer_delay import delay_setting_suffix
 from model.itransformer_correlation import correlation_setting_suffix
+from model.itransformer_calibration import calibration_setting_suffix
 from model.iTransformer_pl import period_lag_setting_suffix
 
 if __name__ == '__main__':
@@ -29,7 +30,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, itransformer_correlation, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, itransformer_calibration, itransformer_correlation, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -92,6 +93,16 @@ if __name__ == '__main__':
     parser.add_argument('--channel_independence', type=bool, default=False, help='whether to use channel_independence mechanism')
     parser.add_argument('--inverse', action='store_true', help='inverse output data', default=False)
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
+    # Context-conditioned low-rank output calibration
+    parser.add_argument('--calibration_rank', type=int, default=8)
+    parser.add_argument('--calibration_hidden', type=int, default=32)
+    parser.add_argument('--calibration_dropout', type=float, default=0.0)
+    parser.add_argument('--calibration_trend_window', type=int, default=24)
+    parser.add_argument('--calibration_scale_limit', type=float, default=0.2)
+    parser.add_argument('--use_calibration', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--use_horizon_factor', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--use_channel_context', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--use_gate', type=int, choices=[0, 1], default=1)
     # Fixed training-label temporal/variate PCA alignment
     parser.add_argument('--lambda_joint', type=float, default=0.1)
     parser.add_argument('--alignment_mode', choices=['none', 'temporal', 'variate', 'joint'], default='joint')
@@ -349,6 +360,8 @@ if __name__ == '__main__':
                 setting += delay_setting_suffix(args)
             elif args.model == 'itransformer_correlation':
                 setting += correlation_setting_suffix(args)
+            elif args.model == 'itransformer_calibration':
+                setting += calibration_setting_suffix(args)
             elif args.model == 'iTransformer_multihead':
                 relation_heads = args.mh_relation_heads or args.n_heads
                 setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
@@ -439,6 +452,8 @@ if __name__ == '__main__':
             setting += delay_setting_suffix(args)
         elif args.model == 'itransformer_correlation':
             setting += correlation_setting_suffix(args)
+        elif args.model == 'itransformer_calibration':
+            setting += calibration_setting_suffix(args)
         elif args.model == 'iTransformer_multihead':
             relation_heads = args.mh_relation_heads or args.n_heads
             setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
