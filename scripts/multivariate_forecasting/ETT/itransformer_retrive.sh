@@ -2,7 +2,8 @@
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES=0
 export OMP_NUM_THREADS=10
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# Resolve the project root from scripts/multivariate_forecasting/ETT.
+cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 # Historical pairs come only from the training split. Training sample indices
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
