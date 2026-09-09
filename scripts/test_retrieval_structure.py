@@ -19,6 +19,7 @@ def config(**overrides):
     values = dict(seq_len=4, pred_len=8, d_model=8, d_ff=16, n_heads=2,
                   e_layers=1, dropout=0., embed='timeF', freq='h', factor=1,
                   activation='gelu', class_strategy='projection', output_attention=False,
+                  retrieval_align_gradients=False, retrieval_horizon_gate=True,
                   use_norm=True, retrieval_memory_size=16, retrieval_top_k=3,
                   retrieval_global_top_k=2, retrieval_chunk_size=3,
                   retrieval_variable_chunk_size=1)

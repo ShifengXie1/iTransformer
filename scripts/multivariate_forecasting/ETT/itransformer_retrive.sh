@@ -9,16 +9,18 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
 # Defaults to retrieval only at all four horizons. PRED_LENS can override the list.
 # Each variable keeps its local Top-K; global context adjusts their weights.
-# Position-aware consensus gating learns separate near/far confidence.
-# RETRIEVAL_LOCAL_CANDIDATES=0 RETRIEVAL_HORIZON_GATE=0 restores the previous full model.
-# RETRIEVAL_GLOBAL_FILTER=0 RETRIEVAL_CONSENSUS_GATE=0 restores the ctx1 structure.
+# The backbone keeps its own supervision and receives direction-aligned fusion
+# gradients only. Position gating is disabled by default.
+# Set RETRIEVAL_ALIGN_GRADIENTS=0 to restore ordinary joint training.
+# Together with that flag, RETRIEVAL_LOCAL_CANDIDATES=0 restores previous full;
+# RETRIEVAL_GLOBAL_FILTER=0 RETRIEVAL_CONSENSUS_GATE=0 restores ctx1.
 # Also set RETRIEVAL_CONTEXTUAL=0 to restore the earlier embedding structure.
 # A shared, zero-initialized temporal map
 # adapts each continuation: Y_ret = sum_k w_k [Y_k + A(X_current - X_k)].
 # Adapted futures fuse in prediction space: Y_pred = Y_base + gate * (Y_ret - Y_base).
 # A run evaluates base (g=0), retrieval (g=1) and fused forecasts together.
 # Standalone baseline training is skipped; compare against the paper's results.
-# RETRIEVAL_BASE_LOSS_WEIGHT=0 and RETRIEVAL_RELIABILITY_GATE=0 are ablations.
+# RETRIEVAL_BASE_LOSS_WEIGHT=0 requires alignment and isolation both disabled.
 # USE_RETRIEVAL=0 or RETRIEVAL_USE_FUTURE=0: original backbone;
 # RETRIEVAL_USE_GATE=0: adapted retrieved forecast wherever history is available;
 # RETRIEVAL_WEIGHTED=0: uniform Top-K. No history always uses the backbone.
@@ -55,8 +57,9 @@ for pred_len in "${horizons[@]}"; do
       --retrieval_local_candidates "${RETRIEVAL_LOCAL_CANDIDATES:-1}" \
       --retrieval_global_top_k "${RETRIEVAL_GLOBAL_TOP_K:-64}" \
       --retrieval_consensus_gate "${RETRIEVAL_CONSENSUS_GATE:-1}" \
-      --retrieval_horizon_gate "${RETRIEVAL_HORIZON_GATE:-1}" \
+      --retrieval_horizon_gate "${RETRIEVAL_HORIZON_GATE:-0}" \
       --retrieval_isolate_backbone "${RETRIEVAL_ISOLATE_BACKBONE:-0}" \
+      --retrieval_align_gradients "${RETRIEVAL_ALIGN_GRADIENTS:-1}" \
       --retrieval_disagreement_penalty "${RETRIEVAL_DISAGREEMENT_PENALTY:-1}" \
       --retrieval_top_k "${RETRIEVAL_TOP_K:-8}" \
       --retrieval_temperature "${RETRIEVAL_TEMPERATURE:-0.1}" \

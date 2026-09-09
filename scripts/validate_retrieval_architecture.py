@@ -5,9 +5,9 @@ backbone initialization and training data order for its horizon/seed. Validation
 selects this run's best weights; test is evaluated once with those weights.
 Standalone iTransformer training is not included.
 
-Default: 5 retrieval variants x 4 horizons x 1 seed = 20 training runs.
-Compare adapted, previous full, local candidates only, position gate only,
-and both changes. Previous six variant names retain their original settings.
+Default: current local_aligned model x 4 horizons x 1 seed = 4 training runs.
+All previous variant names retain their original settings; comparisons must
+be requested explicitly with --variants.
   python scripts/validate_retrieval_architecture.py
   python scripts/validate_retrieval_architecture.py --horizons 720
 Gradient isolation comparison (both disable the position gate; 8 fresh runs):
@@ -49,9 +49,10 @@ VARIANTS = {
     'horizon_only': 'Previous full retrieval with position-aware consensus gate',
     'local_horizon': 'Local candidates + global weighting + position-aware consensus gate',
     'local_isolated': 'Local candidates and previous consensus gate; backbone trained only by auxiliary loss',
+    'local_aligned': 'Local candidates and previous consensus gate; retain only direction-aligned fusion gradients into backbone',
 }
 
-DEFAULT_VARIANTS = ['adapted', 'full', 'local_candidates', 'horizon_only', 'local_horizon']
+DEFAULT_VARIANTS = ['local_aligned']
 
 
 def parser():
@@ -113,9 +114,10 @@ def make_config(args, horizon, variant):
         retrieval_use_future=True, retrieval_use_gate=True, retrieval_weighted=True,
         retrieval_reliability_gate=True, retrieval_contextual=variant != 'adapted',
         retrieval_global_filter=new_structure, retrieval_consensus_gate=new_structure,
-        retrieval_local_candidates=variant in ('local_candidates', 'local_horizon', 'local_isolated'),
+        retrieval_local_candidates=variant in ('local_candidates', 'local_horizon', 'local_isolated', 'local_aligned'),
         retrieval_horizon_gate=variant in ('horizon_only', 'local_horizon'),
         retrieval_isolate_backbone=variant == 'local_isolated',
+        retrieval_align_gradients=variant == 'local_aligned',
         retrieval_disagreement_penalty=variant not in ('no_disagreement', 'all_candidates_no_disagreement'),
         retrieval_global_top_k=args.global_top_k, retrieval_top_k=args.top_k,
         retrieval_memory_size=args.memory_size, retrieval_temperature=args.temperature,

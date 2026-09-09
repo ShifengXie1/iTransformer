@@ -103,10 +103,12 @@ if __name__ == '__main__':
                         help='Maximum causal historical windows kept by the global filter')
     parser.add_argument('--retrieval_consensus_gate', type=int, choices=[0, 1], default=1,
                         help='Horizon-shared gate with monotone variance/disagreement penalties')
-    parser.add_argument('--retrieval_horizon_gate', type=int, choices=[0, 1], default=1,
+    parser.add_argument('--retrieval_horizon_gate', type=int, choices=[0, 1], default=0,
                         help='Learn a context-dependent smooth confidence curve over forecast positions')
     parser.add_argument('--retrieval_isolate_backbone', type=int, choices=[0, 1], default=0,
                         help='Train backbone only with its auxiliary loss; stop fusion/retrieval gradients into it')
+    parser.add_argument('--retrieval_align_gradients', type=int, choices=[0, 1], default=1,
+                        help='Route fusion gradients into backbone only where base/fused errors agree in sign; isolation overrides')
     parser.add_argument('--retrieval_disagreement_penalty', type=int, choices=[0, 1], default=1,
                         help='Penalize base/retrieval disagreement in the consensus gate; 0 is a training ablation')
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)
@@ -122,7 +124,7 @@ if __name__ == '__main__':
     parser.add_argument('--retrieval_reliability_gate', type=int, choices=[0, 1], default=1,
                         help='use similarity statistics, future variance and base/retrieval disagreement')
     parser.add_argument('--retrieval_base_loss_weight', type=float, default=0.2,
-                        help='weight of auxiliary MSE on the jointly trained base forecast; 0 disables')
+                        help='Weight of backbone MSE; must be positive with gradient alignment or isolation')
     parser.add_argument('--retrieval_diagnostics', type=int, choices=[0, 1], default=1,
                         help='save branch MSE/MAE, batch reliability statistics and training curves')
     # Context-conditioned low-rank output calibration

@@ -28,10 +28,9 @@ base/retrieval disagreement D with nonnegative learned coefficients:
 
     Y_pred = Y_base + g * (Y_ret - Y_base)
 
-phi contains three bounded, smooth polynomial functions of relative forecast
-position. Context-dependent coefficients c start at zero, preserving the old
-gate at initialization, and their parameter count does not grow with H.
-retrieval_horizon_gate=False restores the position-independent confidence.
+The optional retrieval_horizon_gate uses three bounded, smooth polynomial
+functions phi of relative forecast position, with zero-initialized coefficients
+c whose parameter count does not grow with H. It is disabled by default (c=0).
 Holding context/similarity fixed, increasing U_h or D_h cannot increase g_h
 or change another horizon's gate. Detached gate evidence prevents the base
 or adapter from changing predictions solely to manipulate confidence.
@@ -39,9 +38,17 @@ Consensus is an agreement signal, not a guarantee that retrieved futures
 are accurate. Both new mechanisms can be disabled to reproduce ctx1.
 
 Training uses MSE(Y_pred, Y) + retrieval_base_loss_weight * MSE(Y_base, Y).
+Default retrieval_align_gradients=True routes the fusion gradient into the
+backbone only where base and fused errors have the same sign, independently
+for each sample, variable and forecast position. The backbone's own MSE is
+always active. Routing uses training targets only in base_auxiliary_loss;
+forward/retrieval/gating never receives targets. This is output-space gradient
+alignment, not a guarantee of nonconflicting shared-parameter gradients.
 With retrieval_isolate_backbone=True, fusion uses stop_gradient(Y_base), and
 all retrieval/gate paths into backbone parameters are detached. The backbone
 then learns only through its auxiliary loss; forward predictions are unchanged.
+Explicit isolation overrides aligned routing. Set both flags False to restore
+ordinary joint training. The runners must add base_auxiliary_loss during training.
 W_r learns through this forecast loss; a separate future-similarity objective
 is not part of this implementation.
 forward(..., return_components=True) returns differentiable branch forecasts
@@ -111,8 +118,9 @@ class Model(OriginalITransformer):
         self.retrieval_consensus_gate = bool(getattr(configs, 'retrieval_consensus_gate', True))
         self.retrieval_disagreement_penalty = bool(getattr(configs, 'retrieval_disagreement_penalty', True))
         self.retrieval_local_candidates = bool(getattr(configs, 'retrieval_local_candidates', True))
-        self.retrieval_horizon_gate = bool(getattr(configs, 'retrieval_horizon_gate', True))
+        self.retrieval_horizon_gate = bool(getattr(configs, 'retrieval_horizon_gate', False))
         self.retrieval_isolate_backbone = bool(getattr(configs, 'retrieval_isolate_backbone', False))
+        self.retrieval_align_gradients = bool(getattr(configs, 'retrieval_align_gradients', True))
         if min(self.seq_len, self.pred_len, self.retrieval_top_k,
                self.retrieval_memory_size, self.retrieval_stride,
                self.retrieval_chunk_size, self.retrieval_variable_chunk_size,
@@ -122,9 +130,10 @@ class Model(OriginalITransformer):
             raise ValueError('retrieval_temperature must be finite and positive')
         if not math.isfinite(self.retrieval_base_loss_weight) or self.retrieval_base_loss_weight < 0:
             raise ValueError('retrieval_base_loss_weight must be finite and nonnegative')
-        if (self.retrieval_isolate_backbone and self.use_retrieval and self.retrieval_use_future
+        if ((self.retrieval_isolate_backbone or self.retrieval_align_gradients)
+                and self.use_retrieval and self.retrieval_use_future
                 and self.retrieval_base_loss_weight == 0):
-            raise ValueError('Backbone isolation requires retrieval_base_loss_weight > 0')
+            raise ValueError('Backbone gradient routing requires retrieval_base_loss_weight > 0')
 
         d_model = configs.d_model
         # Learn reliability in prediction space: one gate per variable/horizon.
@@ -438,7 +447,7 @@ class Model(OriginalITransformer):
                     past_token = self.retrieval_projection(self._context_cache[indices, channels])
                 else:
                     past_token = projection(past)
-                    if self.retrieval_isolate_backbone:
+                    if self.retrieval_isolate_backbone or self.retrieval_align_gradients:
                         past_token = past_token.detach()
                 scores = (F.normalize(query, dim=-1).unsqueeze(2)
                           * F.normalize(past_token.float(), dim=-1)).sum(-1)
@@ -491,9 +500,10 @@ class Model(OriginalITransformer):
         Y_ret wherever history is available. Unavailable history always
         retains the backbone, including when the gate network has biases.
         """
-        if self.retrieval_isolate_backbone:
+        if self.retrieval_isolate_backbone or self.retrieval_align_gradients:
             # Keep the original base tensor in forecast components for its own
-            # loss. Detach here also covers the no-history fallback and old gates.
+            # loss and explicit gradient routing. Detaching here also covers the
+            # no-history fallback and old gates, preventing uncontrolled paths.
             base_prediction = base_prediction.detach()
             current_tokens = current_tokens.detach()
         if self.retrieval_use_gate:
@@ -583,7 +593,7 @@ class Model(OriginalITransformer):
                 query_tokens = self.retrieval_projection(retrieval_context)
         else:
             query_tokens = tokens[:, :variables]
-            if self.retrieval_isolate_backbone:
+            if self.retrieval_isolate_backbone or self.retrieval_align_gradients:
                 query_tokens = query_tokens.detach()
         retrieved = self.retrieve(query_tokens, query_end,
                                   query_past=normalized.permute(0, 2, 1), query_context=query_context)
@@ -634,11 +644,33 @@ class Model(OriginalITransformer):
         return (prediction, attention) if self.output_attention else prediction
 
     def base_auxiliary_loss(self, components, target):
-        """Train the backbone (its sole loss when isolated); supports M/MS/DP."""
+        """Backbone supervision and output-space gradient routing; M/MS/DP.
+
+        Let e_b = base - target, e_f = fused - target and g be the detached
+        fusion gate. In aligned mode, the backbone output gradient is
+        2 * [base_loss_weight * e_b + I(e_b*e_f > 0) * (1-g) * e_f] / numel.
+        The second term retains the ordinary direct fusion gradient only when
+        its direction agrees with standalone MSE. Retrieval and gate parameters
+        still receive the full fused MSE gradient through components['prediction'].
+        The routing term has value zero; logged loss remains fused MSE + base MSE.
+        Selection at validation/test continues to use actual prediction error.
+        """
         if not self.use_retrieval or not self.retrieval_use_future or self.retrieval_base_loss_weight == 0:
             return target.new_zeros(())
-        base = components['base'][:, -target.size(1):, -target.size(2):]
-        return self.retrieval_base_loss_weight * F.mse_loss(base.float(), target.float())
+        base = components['base'][:, -target.size(1):, -target.size(2):].float()
+        target = target.float()
+        loss = self.retrieval_base_loss_weight * F.mse_loss(base, target)
+        if self.retrieval_align_gradients and not self.retrieval_isolate_backbone:
+            with torch.no_grad():
+                prediction = components['prediction'][:, -target.size(1):, -target.size(2):].float()
+                gate = components['gate'][:, -target.size(1):, -target.size(2):].float()
+                base_error = base.detach() - target.detach()
+                fused_error = prediction.detach() - target.detach()
+                # Comparisons avoid multiplying large errors just to get a sign.
+                aligned = ((base_error > 0) & (fused_error > 0)) | ((base_error < 0) & (fused_error < 0))
+                routed_error = torch.where(aligned, (1 - gate) * fused_error, 0.)
+            loss = loss + (2 * routed_error * (base - base.detach())).mean()
+        return loss
 
 
 class _IndexedTrainingDataset(Dataset):
@@ -705,8 +737,10 @@ def retrieval_setting_suffix(configs):
         if not getattr(configs, 'retrieval_disagreement_penalty', True):
             suffix += '_dp0'
         if (getattr(configs, 'retrieval_reliability_gate', True)
-                and getattr(configs, 'retrieval_horizon_gate', True)):
+                and getattr(configs, 'retrieval_horizon_gate', False)):
             suffix += '_hg1'
     if getattr(configs, 'retrieval_isolate_backbone', False):
         suffix += '_iso1'
+    elif getattr(configs, 'retrieval_align_gradients', True):
+        suffix += '_agr1'
     return suffix
