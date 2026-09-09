@@ -53,6 +53,7 @@ for pred_len in "${horizons[@]}"; do
       --retrieval_global_filter "${RETRIEVAL_GLOBAL_FILTER:-1}" \
       --retrieval_global_top_k "${RETRIEVAL_GLOBAL_TOP_K:-64}" \
       --retrieval_consensus_gate "${RETRIEVAL_CONSENSUS_GATE:-1}" \
+      --retrieval_disagreement_penalty "${RETRIEVAL_DISAGREEMENT_PENALTY:-1}" \
       --retrieval_top_k "${RETRIEVAL_TOP_K:-8}" \
       --retrieval_temperature "${RETRIEVAL_TEMPERATURE:-0.1}" \
       --retrieval_memory_size "${RETRIEVAL_MEMORY_SIZE:-1024}" \

@@ -101,6 +101,8 @@ if __name__ == '__main__':
                         help='Maximum causal historical windows kept by the global filter')
     parser.add_argument('--retrieval_consensus_gate', type=int, choices=[0, 1], default=1,
                         help='Horizon-shared gate with monotone variance/disagreement penalties')
+    parser.add_argument('--retrieval_disagreement_penalty', type=int, choices=[0, 1], default=1,
+                        help='Penalize base/retrieval disagreement in the consensus gate; 0 is a training ablation')
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)
     parser.add_argument('--retrieval_memory_size', type=int, default=1024)
     parser.add_argument('--retrieval_stride', type=int, default=1)

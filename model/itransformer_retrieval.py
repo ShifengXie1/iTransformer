@@ -102,6 +102,7 @@ class Model(OriginalITransformer):
         self.retrieval_global_filter = bool(getattr(configs, 'retrieval_global_filter', True))
         self.retrieval_global_top_k = int(getattr(configs, 'retrieval_global_top_k', 64))
         self.retrieval_consensus_gate = bool(getattr(configs, 'retrieval_consensus_gate', True))
+        self.retrieval_disagreement_penalty = bool(getattr(configs, 'retrieval_disagreement_penalty', True))
         if min(self.seq_len, self.pred_len, self.retrieval_top_k,
                self.retrieval_memory_size, self.retrieval_stride,
                self.retrieval_chunk_size, self.retrieval_variable_chunk_size,
@@ -466,7 +467,10 @@ class Model(OriginalITransformer):
                 uncertainty = torch.log1p(retrieved.future_variance.detach().float().clamp_min(0))
                 disagreement = torch.log1p((retrieved.future.detach().float() - base_prediction.detach().float()).abs())
                 penalties = F.softplus(self.consensus_penalty.float())
-                gate = torch.sigmoid(confidence - penalties[0] * uncertainty - penalties[1] * disagreement)
+                gate_logit = confidence - penalties[0] * uncertainty
+                if self.retrieval_disagreement_penalty:
+                    gate_logit = gate_logit - penalties[1] * disagreement
+                gate = torch.sigmoid(gate_logit)
             elif self.retrieval_reliability_gate:
                 if retrieved.similarity_stats is None or retrieved.future_variance is None:
                     raise ValueError('Reliability gate requires similarity_stats and future_variance')
@@ -650,4 +654,6 @@ def retrieval_setting_suffix(configs):
         suffix += '_gc{}'.format(getattr(configs, 'retrieval_global_top_k', 64))
     if getattr(configs, 'retrieval_consensus_gate', True):
         suffix += '_cg1'
+        if not getattr(configs, 'retrieval_disagreement_penalty', True):
+            suffix += '_dp0'
     return suffix
