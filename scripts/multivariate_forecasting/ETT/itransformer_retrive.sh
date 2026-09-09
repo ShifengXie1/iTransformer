@@ -8,7 +8,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 # Historical pairs come only from the training split. Training sample indices
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
 # Defaults to retrieval only at all four horizons. PRED_LENS can override the list.
-# Past embeddings select neighbors. A shared, zero-initialized temporal map
+# Encoder context plus a dedicated projection selects neighbors; set
+# RETRIEVAL_CONTEXTUAL=0 to reproduce the previous embedding retrieval.
+# A shared, zero-initialized temporal map
 # adapts each continuation: Y_ret = sum_k w_k [Y_k + A(X_current - X_k)].
 # Adapted futures fuse in prediction space: Y_pred = Y_base + gate * (Y_ret - Y_base).
 # A run evaluates base (g=0), retrieval (g=1) and fused forecasts together.
@@ -45,6 +47,7 @@ for pred_len in "${horizons[@]}"; do
       --enc_in 7 --dec_in 7 --c_out 7 \
       --e_layers 2 --n_heads 8 --d_model "${D_MODEL:-$width}" --d_ff "${D_FF:-$width}" \
       --use_retrieval "${USE_RETRIEVAL:-1}" \
+      --retrieval_contextual "${RETRIEVAL_CONTEXTUAL:-1}" \
       --retrieval_top_k "${RETRIEVAL_TOP_K:-8}" \
       --retrieval_temperature "${RETRIEVAL_TEMPERATURE:-0.1}" \
       --retrieval_memory_size "${RETRIEVAL_MEMORY_SIZE:-1024}" \

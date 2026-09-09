@@ -92,6 +92,8 @@ if __name__ == '__main__':
     parser.add_argument('--class_strategy', type=str, default='projection', help='projection/average/cls_token')
     # Variable-wise past retrieval and future fusion in prediction space
     parser.add_argument('--use_retrieval', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--retrieval_contextual', type=int, choices=[0, 1], default=1,
+                        help='Use multivariate encoder context and a dedicated retrieval projection; 0 restores embedding retrieval')
     parser.add_argument('--retrieval_top_k', type=int, default=8)
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)
     parser.add_argument('--retrieval_memory_size', type=int, default=1024)

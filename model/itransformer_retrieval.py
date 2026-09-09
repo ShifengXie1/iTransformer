@@ -1,7 +1,14 @@
 """VR-iTransformer: variable-wise retrieval with prediction-space fusion.
 
 Each variable independently retrieves the same variable's historical (X, Y)
-pairs using past embeddings. The original iTransformer produces Y_base;
+pairs using contextual past representations followed by a retrieval-specific
+projection: r_n = W_r Encoder(E(X))_n. Both query and memory encodings see
+all data variables, without timestamp tokens, and disable dropout in this
+retrieval path only. Forecasting retains its normal covariates and dropout.
+Query and memory contexts are detached before W_r. Retrieval similarity trains
+W_r through both selected keys and queries; the shared encoder learns through
+the forecasting path, avoiding a second, competing metric-learning gradient.
+The original iTransformer produces Y_base;
 historical futures are adapted to the current past before producing Y_ret:
 
     Y_ret = sum_k w_k * [Y_k + A(X_query - X_k)]
@@ -10,12 +17,14 @@ A is a shared, bias-free temporal linear map initialized to zero. It learns
 how differences between past windows change their continuations, instead of
 assuming similar past embeddings imply interchangeable futures. The same
 adapted neighbors supply the gate's disagreement statistics. A horizon-wise
-gate conditioned on current state, similarity statistics, future disagreement and the difference
-between base/retrieval predictions combines the predictions:
+gate conditioned on current state, similarity statistics, future disagreement
+and the difference between base/retrieval predictions combines the predictions:
 
     Y_pred = Y_base + sigmoid(MLP([z, reliability])) * (Y_ret - Y_base)
 
 Training uses MSE(Y_pred, Y) + retrieval_base_loss_weight * MSE(Y_base, Y).
+W_r learns through this forecast loss; a separate future-similarity objective
+is not part of this implementation.
 forward(..., return_components=True) returns differentiable branch forecasts
 and detached diagnostics through the normal DataParallel output path.
 
@@ -34,10 +43,12 @@ eligible only if its entire future ends at or before query_end. It is required
 during training; evaluation may omit it ONLY for queries after the training
 split. Neither decoder inputs nor evaluation labels ever populate the memory.
 The raw series and candidate starts are checkpoint buffers; keys are encoded
-with current embedding weights, so optimizer updates cannot leave stale keys.
+with current embedding, encoder and retrieval projection weights, so optimizer
+updates cannot leave stale keys.
 """
 
 import math
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import torch
@@ -73,6 +84,7 @@ class Model(OriginalITransformer):
         self.retrieval_weighted = bool(getattr(configs, 'retrieval_weighted', True))
         self.retrieval_reliability_gate = bool(getattr(configs, 'retrieval_reliability_gate', True))
         self.retrieval_base_loss_weight = float(getattr(configs, 'retrieval_base_loss_weight', 0.2))
+        self.retrieval_contextual = bool(getattr(configs, 'retrieval_contextual', True))
         if min(self.seq_len, self.pred_len, self.retrieval_top_k,
                self.retrieval_memory_size, self.retrieval_stride,
                self.retrieval_chunk_size, self.retrieval_variable_chunk_size) < 1:
@@ -96,6 +108,10 @@ class Model(OriginalITransformer):
         # Zero initialization starts with the existing retrieval forecast.
         self.continuation_adapter = nn.Linear(self.seq_len, self.pred_len, bias=False)
         nn.init.zeros_(self.continuation_adapter.weight)
+        self.retrieval_projection = (nn.Linear(d_model, d_model, bias=False)
+                                     if self.retrieval_contextual else nn.Identity())
+        if self.retrieval_contextual:
+            nn.init.eye_(self.retrieval_projection.weight)
         self.register_buffer('memory_series', torch.empty(0, 0))
         self.register_buffer('memory_starts', torch.empty(0, dtype=torch.long))
         self.register_buffer('memory_mean', torch.empty(0))
@@ -103,6 +119,7 @@ class Model(OriginalITransformer):
         # Evaluation cache is transient; version checks also catch optimizer or
         # load_state_dict updates made while a model remains in eval mode.
         self._key_cache = None
+        self._context_cache = None
         self._key_cache_version = None
 
     @torch.no_grad()
@@ -132,6 +149,7 @@ class Model(OriginalITransformer):
         self.memory_mean = series.new_empty(0)
         self.memory_scale = series.new_empty(0)
         self._key_cache = None
+        self._context_cache = None
         self._key_cache_version = None
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -144,6 +162,7 @@ class Model(OriginalITransformer):
                 current = getattr(self, name)
                 setattr(self, name, current.new_empty(value.shape))
         self._key_cache = None
+        self._context_cache = None
         self._key_cache_version = None
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                      missing_keys, unexpected_keys, error_msgs)
@@ -151,6 +170,7 @@ class Model(OriginalITransformer):
     def train(self, mode=True):
         if mode:
             self._key_cache = None
+            self._context_cache = None
             self._key_cache_version = None
         return super().train(mode)
 
@@ -169,7 +189,45 @@ class Model(OriginalITransformer):
             future = (future - mean) / std
         return (past, future, std.squeeze(-1)) if return_std else (past, future)
 
+    @contextmanager
+    def _retrieval_dropout_off(self):
+        # Restore individual flags even after an exception. This affects only
+        # retrieval passes, not the subsequent forecasting pass or gradients.
+        modules = [m for m in self.encoder.modules() if isinstance(m, nn.Dropout)]
+        flags = [m.training for m in modules]
+        try:
+            for module in modules:
+                module.training = False
+            yield
+        finally:
+            for module, flag in zip(modules, flags):
+                module.training = flag
+
+    def encode_retrieval_context(self, normalized_past):
+        """Deterministic [B,N,L] -> [B,N,D] using all current data variables.
+
+        Inputs use per-window normalization when use_norm is enabled. History
+        and queries intentionally omit time tokens: memory stores only data_x,
+        so adding query-only time tokens would put them in different spaces.
+        """
+        with torch.autocast(device_type=normalized_past.device.type, enabled=False):
+            with self._retrieval_dropout_off():
+                tokens = self.enc_embedding.value_embedding(normalized_past.float())
+                return self.encoder(tokens, attn_mask=None)[0]
+
+    def _history_context(self, start, stop):
+        # Gather the entire multivariate window before extracting variable n.
+        # Encoding each selected variable alone would discard its context.
+        past, _ = self._windows(
+            self.memory_starts[start:stop, None],
+            torch.arange(self.memory_series.size(1), device=self.memory_series.device)[None, :],
+            include_future=False)
+        return self.encode_retrieval_context(past)
+
     def _encode_keys(self, start, stop, first_var, last_var):
+        if self.retrieval_contextual:
+            context = self._history_context(start, stop)
+            return F.normalize(self.retrieval_projection(context[:, first_var:last_var]).float(), dim=-1)
         past, _ = self._windows(
             self.memory_starts[start:stop, None],
             torch.arange(first_var, last_var, device=self.memory_series.device)[None, :],
@@ -216,7 +274,8 @@ class Model(OriginalITransformer):
 
         Invalid neighbors have index -1 and weight zero. The discrete Top-K
         search has no gradient; selected keys and similarity weights are
-        recomputed with gradients. Pass pre-dropout past embeddings and
+        recomputed with gradients. In contextual mode pass W_r-projected
+        encode_retrieval_context outputs; otherwise pass past embeddings. Pass
         normalized query_past [B,N,L] to adapt historical continuations.
         Omitting query_past exposes the raw historical retrieval for inspection.
         """
@@ -236,19 +295,28 @@ class Model(OriginalITransformer):
         # Float32 similarities and softmax also handle flat windows under AMP.
         with torch.autocast(device_type=query_tokens.device.type, enabled=False):
             projection = self.enc_embedding.value_embedding
-            version = (projection.weight._version, projection.bias._version,
+            key_parameters = list(projection.parameters())
+            if self.retrieval_contextual:
+                key_parameters += list(self.encoder.parameters()) + list(self.retrieval_projection.parameters())
+            version = (tuple((id(p), p._version) for p in key_parameters),
                        self.memory_series._version, self.memory_starts._version,
-                       query_tokens.device, projection.weight.dtype, self.use_norm)
-            if self.training:
-                self._key_cache = None
-            elif self._key_cache is None or self._key_cache_version != version:
+                       query_tokens.device, projection.weight.dtype, self.use_norm, self.retrieval_contextual)
+            if self.training or self._key_cache is None or self._key_cache_version != version:
                 with torch.no_grad():
-                    self._key_cache = torch.cat([
-                        self._encode_keys(start, min(start + self.retrieval_chunk_size,
-                                                     self.memory_starts.numel()),
-                                          0, query_tokens.size(1))
-                        for start in range(0, self.memory_starts.numel(), self.retrieval_chunk_size)
-                    ], dim=0)
+                    chunks = range(0, self.memory_starts.numel(), self.retrieval_chunk_size)
+                    if self.retrieval_contextual:
+                        self._context_cache = torch.cat([
+                            self._history_context(start, min(start + self.retrieval_chunk_size,
+                                                             self.memory_starts.numel()))
+                            for start in chunks], dim=0)
+                        self._key_cache = F.normalize(self.retrieval_projection(self._context_cache).float(), dim=-1)
+                    else:
+                        self._context_cache = None
+                        self._key_cache = torch.cat([
+                            self._encode_keys(start, min(start + self.retrieval_chunk_size,
+                                                         self.memory_starts.numel()),
+                                              0, query_tokens.size(1))
+                            for start in chunks], dim=0)
                 self._key_cache_version = version
             futures, all_indices, all_weights, similarities = [], [], [], []
             statistics, variances, past_stds = [], [], []
@@ -260,7 +328,12 @@ class Model(OriginalITransformer):
                 past, future, past_std = self._windows(self.memory_starts[indices], channels, return_std=True)
                 if query_past is not None:
                     future = self._adapt_futures(query_past[:, first:last].float(), past, future)
-                past_token = projection(past)
+                if self.retrieval_contextual:
+                    # Stop-gradient memory contexts avoid retaining the whole
+                    # bank's encoder graph. Selected W_r keys remain trainable.
+                    past_token = self.retrieval_projection(self._context_cache[indices, channels])
+                else:
+                    past_token = projection(past)
                 scores = (F.normalize(query, dim=-1).unsqueeze(2)
                           * F.normalize(past_token.float(), dim=-1)).sum(-1)
                 if self.retrieval_weighted:
@@ -351,9 +424,18 @@ class Model(OriginalITransformer):
         # and queries for selecting historical cases during training.
         tokens = self.enc_embedding.value_embedding(inputs)
         encoded = self.enc_embedding.dropout(tokens)
-        retrieved = self.retrieve(tokens[:, :variables], query_end,
+        if self.retrieval_contextual:
+            # Keep metric-learning gradients in W_r. Forecast loss still trains
+            # the encoder normally through base_prediction below.
+            with torch.no_grad():
+                retrieval_context = self.encode_retrieval_context(normalized.permute(0, 2, 1))
+            with torch.autocast(device_type=x_enc.device.type, enabled=False):
+                query_tokens = self.retrieval_projection(retrieval_context)
+        else:
+            query_tokens = tokens[:, :variables]
+        retrieved = self.retrieve(query_tokens, query_end,
                                   query_past=normalized.permute(0, 2, 1))
-        # Only the current window and its covariates enter self-attention.
+        # Forecast attention sees only the current window and its covariates.
         encoded, attention = self.encoder(encoded, attn_mask=None)
         base_prediction = self.projector(encoded)[:, :variables]
         prediction, gate = self.fuse_prediction(base_prediction, tokens[:, :variables], retrieved, return_gate=True)
@@ -450,11 +532,12 @@ def align_retrieval_prediction_data(model, dataset):
 
 
 def retrieval_setting_suffix(configs):
-    """Version continuation-adapter checkpoints and distinguish loss ablations."""
+    """Separate contextual checkpoints while retaining the previous ablation path."""
     defaults = [('use_retrieval', 1), ('retrieval_top_k', 8),
                 ('retrieval_temperature', 0.1), ('retrieval_memory_size', 1024),
                 ('retrieval_stride', 1), ('retrieval_use_future', 1),
                 ('retrieval_use_gate', 1), ('retrieval_weighted', 1),
                 ('retrieval_reliability_gate', 1), ('retrieval_base_loss_weight', 0.2)]
-    return '_vradapt{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}_rg{}_bl{}'.format(
+    suffix = '_vradapt{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}_rg{}_bl{}'.format(
         *(getattr(configs, name, default) for name, default in defaults))
+    return suffix + '_ctx1' if getattr(configs, 'retrieval_contextual', True) else suffix
