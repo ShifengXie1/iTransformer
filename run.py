@@ -96,11 +96,15 @@ if __name__ == '__main__':
                         help='Use multivariate encoder context and a dedicated retrieval projection; 0 restores embedding retrieval')
     parser.add_argument('--retrieval_top_k', type=int, default=8)
     parser.add_argument('--retrieval_global_filter', type=int, choices=[0, 1], default=1,
-                        help='Filter by global window context before variable-specific Top-K')
+                        help='Use global window context in retrieval scoring')
+    parser.add_argument('--retrieval_local_candidates', type=int, choices=[0, 1], default=1,
+                        help='Keep variable-specific Top-K from all causal history; 0 restores global shortlist truncation')
     parser.add_argument('--retrieval_global_top_k', type=int, default=64,
                         help='Maximum causal historical windows kept by the global filter')
     parser.add_argument('--retrieval_consensus_gate', type=int, choices=[0, 1], default=1,
                         help='Horizon-shared gate with monotone variance/disagreement penalties')
+    parser.add_argument('--retrieval_horizon_gate', type=int, choices=[0, 1], default=1,
+                        help='Learn a context-dependent smooth confidence curve over forecast positions')
     parser.add_argument('--retrieval_disagreement_penalty', type=int, choices=[0, 1], default=1,
                         help='Penalize base/retrieval disagreement in the consensus gate; 0 is a training ablation')
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)

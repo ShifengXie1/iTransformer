@@ -5,7 +5,9 @@ backbone initialization and training data order for its horizon/seed. Validation
 selects this run's best weights; test is evaluated once with those weights.
 Standalone iTransformer training is not included.
 
-Default: 6 retrieval variants x 4 horizons x 1 seed = 24 training runs.
+Default: 5 retrieval variants x 4 horizons x 1 seed = 20 training runs.
+Compare adapted, previous full, local candidates only, position gate only,
+and both changes. Previous six variant names retain their original settings.
   python scripts/validate_retrieval_architecture.py
   python scripts/validate_retrieval_architecture.py --horizons 720
 
@@ -41,7 +43,12 @@ VARIANTS = {
     'all_candidates': 'Full model without global shortlist truncation; keep global score weighting',
     'no_disagreement': 'Full model without the monotone disagreement penalty; keep variance penalty',
     'all_candidates_no_disagreement': 'Remove shortlist truncation and disagreement penalty together',
+    'local_candidates': 'Variable-specific causal Top-K with global weighting; previous consensus gate',
+    'horizon_only': 'Previous full retrieval with position-aware consensus gate',
+    'local_horizon': 'Local candidates + global weighting + position-aware consensus gate',
 }
+
+DEFAULT_VARIANTS = ['adapted', 'full', 'local_candidates', 'horizon_only', 'local_horizon']
 
 
 def parser():
@@ -51,7 +58,7 @@ def parser():
     p.add_argument('--features', choices=['M', 'MS', 'S'], default='M')
     p.add_argument('--target', default='OT')
     p.add_argument('--horizons', type=int, nargs='+', choices=[96, 192, 336, 720], default=[96, 192, 336, 720])
-    p.add_argument('--variants', nargs='+', choices=list(VARIANTS), default=list(VARIANTS))
+    p.add_argument('--variants', nargs='+', choices=list(VARIANTS), default=DEFAULT_VARIANTS)
     p.add_argument('--seeds', type=int, nargs='+', default=[2023])
     p.add_argument('--seq-len', type=int, default=96)
     p.add_argument('--label-len', type=int, default=48)
@@ -103,6 +110,8 @@ def make_config(args, horizon, variant):
         retrieval_use_future=True, retrieval_use_gate=True, retrieval_weighted=True,
         retrieval_reliability_gate=True, retrieval_contextual=variant != 'adapted',
         retrieval_global_filter=new_structure, retrieval_consensus_gate=new_structure,
+        retrieval_local_candidates=variant in ('local_candidates', 'local_horizon'),
+        retrieval_horizon_gate=variant in ('horizon_only', 'local_horizon'),
         retrieval_disagreement_penalty=variant not in ('no_disagreement', 'all_candidates_no_disagreement'),
         retrieval_global_top_k=args.global_top_k, retrieval_top_k=args.top_k,
         retrieval_memory_size=args.memory_size, retrieval_temperature=args.temperature,
@@ -214,9 +223,13 @@ def train_variant(args, cfg, variant, seed, datasets, device, directory):
                   metric_note='base is this retrieval model\'s jointly trained branch, not a standalone baseline.')
     write_json(directory / 'metrics.json', report)
     return dict(horizon=cfg.pred_len, seed=seed, variant=variant, best_epoch=best_epoch,
+                partial_data=report['partial_data'],
                 validation_mse=best, **{k: test[k] for k in (
                     'base_mse', 'retrieval_mse', 'fused_mse', 'fused_mae', 'mean_gate',
-                    'fused_mse_q1', 'fused_mse_q2', 'fused_mse_q3', 'fused_mse_q4')})
+                    'fused_mse_q1', 'fused_mse_q2', 'fused_mse_q3', 'fused_mse_q4',
+                    'base_mse_q1', 'base_mse_q2', 'base_mse_q3', 'base_mse_q4',
+                    'retrieval_mse_q1', 'retrieval_mse_q2', 'retrieval_mse_q3', 'retrieval_mse_q4',
+                    'mean_gate_q1', 'mean_gate_q2', 'mean_gate_q3', 'mean_gate_q4')})
 
 
 def main():

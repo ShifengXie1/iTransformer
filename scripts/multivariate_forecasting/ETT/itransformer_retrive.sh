@@ -8,8 +8,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 # Historical pairs come only from the training split. Training sample indices
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
 # Defaults to retrieval only at all four horizons. PRED_LENS can override the list.
-# Global context selects candidate windows, then local variable embeddings
-# refine Top-K. Horizon-shared consensus gating suppresses conflicting futures.
+# Each variable keeps its local Top-K; global context adjusts their weights.
+# Position-aware consensus gating learns separate near/far confidence.
+# RETRIEVAL_LOCAL_CANDIDATES=0 RETRIEVAL_HORIZON_GATE=0 restores the previous full model.
 # RETRIEVAL_GLOBAL_FILTER=0 RETRIEVAL_CONSENSUS_GATE=0 restores the ctx1 structure.
 # Also set RETRIEVAL_CONTEXTUAL=0 to restore the earlier embedding structure.
 # A shared, zero-initialized temporal map
@@ -51,8 +52,10 @@ for pred_len in "${horizons[@]}"; do
       --use_retrieval "${USE_RETRIEVAL:-1}" \
       --retrieval_contextual "${RETRIEVAL_CONTEXTUAL:-1}" \
       --retrieval_global_filter "${RETRIEVAL_GLOBAL_FILTER:-1}" \
+      --retrieval_local_candidates "${RETRIEVAL_LOCAL_CANDIDATES:-1}" \
       --retrieval_global_top_k "${RETRIEVAL_GLOBAL_TOP_K:-64}" \
       --retrieval_consensus_gate "${RETRIEVAL_CONSENSUS_GATE:-1}" \
+      --retrieval_horizon_gate "${RETRIEVAL_HORIZON_GATE:-1}" \
       --retrieval_disagreement_penalty "${RETRIEVAL_DISAGREEMENT_PENALTY:-1}" \
       --retrieval_top_k "${RETRIEVAL_TOP_K:-8}" \
       --retrieval_temperature "${RETRIEVAL_TEMPERATURE:-0.1}" \

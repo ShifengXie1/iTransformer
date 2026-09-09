@@ -1,11 +1,10 @@
-"""Global-context-constrained variable retrieval and consensus-aware fusion.
+"""Local-first retrieval with global weighting and position-aware fusion.
 
-Default retrieval first pools all contextual variable tokens and projects the
-pooled state with W_r. Causal global Top-G selects one shared candidate set per
-query. Each variable then refines Top-K using its OWN past embedding inside
-that set, preserving local trajectory detail instead of replacing it with
-mixed encoder tokens. Selected weights use the mean of local/global cosines,
-so global compatibility remains a differentiable prior after hard selection.
+Default retrieval selects each variable's Top-K from ALL causally eligible
+histories using its own past embedding. Global context cannot discard those
+neighbors: pooled contextual tokens projected with W_r only contribute to
+their weights, using the mean of local/global cosines. Setting
+retrieval_local_candidates=False restores the previous global Top-G shortlist.
 
 Query and memory contextual encodings see all data variables, omit timestamp
 tokens, and disable dropout in this retrieval path only. Detached encoder
@@ -23,11 +22,16 @@ adapted neighbors supply disagreement statistics. The default gate shares its
 parameters across horizons and penalizes each step's uncertainty U and
 base/retrieval disagreement D with nonnegative learned coefficients:
 
-    g_h = sigmoid(a(z, similarity) - softplus(b_U)*log1p(U_h)
+    g_h = sigmoid(a(z, similarity) + c(z, similarity) @ phi(h)
+                                  - softplus(b_U)*log1p(U_h)
                                   - softplus(b_D)*log1p(D_h))
 
     Y_pred = Y_base + g * (Y_ret - Y_base)
 
+phi contains three bounded, smooth polynomial functions of relative forecast
+position. Context-dependent coefficients c start at zero, preserving the old
+gate at initialization, and their parameter count does not grow with H.
+retrieval_horizon_gate=False restores the position-independent confidence.
 Holding context/similarity fixed, increasing U_h or D_h cannot increase g_h
 or change another horizon's gate. Detached gate evidence prevents the base
 or adapter from changing predictions solely to manipulate confidence.
@@ -103,6 +107,8 @@ class Model(OriginalITransformer):
         self.retrieval_global_top_k = int(getattr(configs, 'retrieval_global_top_k', 64))
         self.retrieval_consensus_gate = bool(getattr(configs, 'retrieval_consensus_gate', True))
         self.retrieval_disagreement_penalty = bool(getattr(configs, 'retrieval_disagreement_penalty', True))
+        self.retrieval_local_candidates = bool(getattr(configs, 'retrieval_local_candidates', True))
+        self.retrieval_horizon_gate = bool(getattr(configs, 'retrieval_horizon_gate', True))
         if min(self.seq_len, self.pred_len, self.retrieval_top_k,
                self.retrieval_memory_size, self.retrieval_stride,
                self.retrieval_chunk_size, self.retrieval_variable_chunk_size,
@@ -136,6 +142,16 @@ class Model(OriginalITransformer):
                                      if self.retrieval_contextual or self.retrieval_global_filter else nn.Identity())
         if self.retrieval_contextual or self.retrieval_global_filter:
             nn.init.eye_(self.retrieval_projection.weight)
+        if consensus and self.retrieval_horizon_gate:
+            # A small context-dependent smooth curve instead of H independent
+            # gate heads. Construct after existing modules to preserve their RNG.
+            self.horizon_gate = nn.Linear(d_model, 3)
+            nn.init.zeros_(self.horizon_gate.weight)
+            nn.init.zeros_(self.horizon_gate.bias)
+            position = torch.linspace(-1., 1., self.pred_len)
+            basis = torch.stack((position, (3 * position.square() - 1) / 2,
+                                 (5 * position.pow(3) - 3 * position) / 2))
+            self.register_buffer('horizon_basis', basis, persistent=False)
         self.register_buffer('memory_series', torch.empty(0, 0))
         self.register_buffer('memory_starts', torch.empty(0, dtype=torch.long))
         self.register_buffer('memory_mean', torch.empty(0))
@@ -385,7 +401,16 @@ class Model(OriginalITransformer):
                             for start in chunks], dim=0)
                 self._key_cache_version = version
             candidates = (self._select_global_candidates(query_context, query_end)
-                          if self.retrieval_global_filter else None)
+                          if self.retrieval_global_filter and not self.retrieval_local_candidates else None)
+            global_candidate_count = None
+            if self.retrieval_global_filter:
+                if candidates is not None:
+                    global_candidate_count = candidates[1].sum(-1)
+                else:
+                    ends = self.memory_starts + self.seq_len + self.pred_len
+                    global_candidate_count = (ends.new_full((query_tokens.size(0),), ends.numel())
+                                              if query_end is None else
+                                              torch.searchsorted(ends, query_end, right=True))
             futures, all_indices, all_weights, similarities = [], [], [], []
             statistics, variances, past_stds = [], [], []
             global_similarities = []
@@ -446,7 +471,7 @@ class Model(OriginalITransformer):
                                    torch.cat(all_weights, dim=1), torch.cat(similarities, dim=1),
                                    torch.cat(statistics, dim=1), torch.cat(variances, dim=1),
                                    torch.cat(past_stds, dim=1),
-                                   candidates[1].sum(-1) if candidates is not None else None,
+                                   global_candidate_count,
                                    torch.cat(global_similarities, dim=1) if global_similarities else None)
 
     def fuse_prediction(self, base_prediction, current_tokens, retrieved, return_gate=False):
@@ -463,7 +488,13 @@ class Model(OriginalITransformer):
                     raise ValueError('Consensus gate requires similarity_stats and future_variance')
                 context = torch.cat((current_tokens.detach(),
                                      retrieved.similarity_stats.detach().to(current_tokens.dtype)), dim=-1)
-                confidence = self.prediction_gate(context).float()
+                hidden = self.prediction_gate[1](self.prediction_gate[0](context))
+                confidence = self.prediction_gate[2](hidden).float()
+                if self.retrieval_horizon_gate:
+                    # U/D remain separate monotone penalties. Position evidence
+                    # never includes targets or another step's prediction error.
+                    with torch.autocast(device_type=hidden.device.type, enabled=False):
+                        confidence = confidence + self.horizon_gate(hidden.float()) @ self.horizon_basis.float()
                 uncertainty = torch.log1p(retrieved.future_variance.detach().float().clamp_min(0))
                 disagreement = torch.log1p((retrieved.future.detach().float() - base_prediction.detach().float()).abs())
                 penalties = F.softplus(self.consensus_penalty.float())
@@ -651,9 +682,13 @@ def retrieval_setting_suffix(configs):
     if getattr(configs, 'retrieval_contextual', True):
         suffix += '_ctx1'
     if getattr(configs, 'retrieval_global_filter', True):
-        suffix += '_gc{}'.format(getattr(configs, 'retrieval_global_top_k', 64))
+        suffix += ('_lc1' if getattr(configs, 'retrieval_local_candidates', True) else
+                   '_gc{}'.format(getattr(configs, 'retrieval_global_top_k', 64)))
     if getattr(configs, 'retrieval_consensus_gate', True):
         suffix += '_cg1'
         if not getattr(configs, 'retrieval_disagreement_penalty', True):
             suffix += '_dp0'
+        if (getattr(configs, 'retrieval_reliability_gate', True)
+                and getattr(configs, 'retrieval_horizon_gate', True)):
+            suffix += '_hg1'
     return suffix
