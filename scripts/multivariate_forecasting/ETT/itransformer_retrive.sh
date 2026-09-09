@@ -8,8 +8,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 # Historical pairs come only from the training split. Training sample indices
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
 # Defaults to retrieval only at all four horizons. PRED_LENS can override the list.
-# Encoder context plus a dedicated projection selects neighbors; set
-# RETRIEVAL_CONTEXTUAL=0 to reproduce the previous embedding retrieval.
+# Global context selects candidate windows, then local variable embeddings
+# refine Top-K. Horizon-shared consensus gating suppresses conflicting futures.
+# RETRIEVAL_GLOBAL_FILTER=0 RETRIEVAL_CONSENSUS_GATE=0 restores the ctx1 structure.
+# Also set RETRIEVAL_CONTEXTUAL=0 to restore the earlier embedding structure.
 # A shared, zero-initialized temporal map
 # adapts each continuation: Y_ret = sum_k w_k [Y_k + A(X_current - X_k)].
 # Adapted futures fuse in prediction space: Y_pred = Y_base + gate * (Y_ret - Y_base).
@@ -48,6 +50,9 @@ for pred_len in "${horizons[@]}"; do
       --e_layers 2 --n_heads 8 --d_model "${D_MODEL:-$width}" --d_ff "${D_FF:-$width}" \
       --use_retrieval "${USE_RETRIEVAL:-1}" \
       --retrieval_contextual "${RETRIEVAL_CONTEXTUAL:-1}" \
+      --retrieval_global_filter "${RETRIEVAL_GLOBAL_FILTER:-1}" \
+      --retrieval_global_top_k "${RETRIEVAL_GLOBAL_TOP_K:-64}" \
+      --retrieval_consensus_gate "${RETRIEVAL_CONSENSUS_GATE:-1}" \
       --retrieval_top_k "${RETRIEVAL_TOP_K:-8}" \
       --retrieval_temperature "${RETRIEVAL_TEMPERATURE:-0.1}" \
       --retrieval_memory_size "${RETRIEVAL_MEMORY_SIZE:-1024}" \

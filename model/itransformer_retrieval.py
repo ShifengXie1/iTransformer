@@ -1,13 +1,16 @@
-"""VR-iTransformer: variable-wise retrieval with prediction-space fusion.
+"""Global-context-constrained variable retrieval and consensus-aware fusion.
 
-Each variable independently retrieves the same variable's historical (X, Y)
-pairs using contextual past representations followed by a retrieval-specific
-projection: r_n = W_r Encoder(E(X))_n. Both query and memory encodings see
-all data variables, without timestamp tokens, and disable dropout in this
-retrieval path only. Forecasting retains its normal covariates and dropout.
-Query and memory contexts are detached before W_r. Retrieval similarity trains
-W_r through both selected keys and queries; the shared encoder learns through
-the forecasting path, avoiding a second, competing metric-learning gradient.
+Default retrieval first pools all contextual variable tokens and projects the
+pooled state with W_r. Causal global Top-G selects one shared candidate set per
+query. Each variable then refines Top-K using its OWN past embedding inside
+that set, preserving local trajectory detail instead of replacing it with
+mixed encoder tokens. Selected weights use the mean of local/global cosines,
+so global compatibility remains a differentiable prior after hard selection.
+
+Query and memory contextual encodings see all data variables, omit timestamp
+tokens, and disable dropout in this retrieval path only. Detached encoder
+contexts train W_r through the selected weights; the backbone still learns
+through the forecasting path. Forecasting retains its covariates and dropout.
 The original iTransformer produces Y_base;
 historical futures are adapted to the current past before producing Y_ret:
 
@@ -16,11 +19,20 @@ historical futures are adapted to the current past before producing Y_ret:
 A is a shared, bias-free temporal linear map initialized to zero. It learns
 how differences between past windows change their continuations, instead of
 assuming similar past embeddings imply interchangeable futures. The same
-adapted neighbors supply the gate's disagreement statistics. A horizon-wise
-gate conditioned on current state, similarity statistics, future disagreement
-and the difference between base/retrieval predictions combines the predictions:
+adapted neighbors supply disagreement statistics. The default gate shares its
+parameters across horizons and penalizes each step's uncertainty U and
+base/retrieval disagreement D with nonnegative learned coefficients:
 
-    Y_pred = Y_base + sigmoid(MLP([z, reliability])) * (Y_ret - Y_base)
+    g_h = sigmoid(a(z, similarity) - softplus(b_U)*log1p(U_h)
+                                  - softplus(b_D)*log1p(D_h))
+
+    Y_pred = Y_base + g * (Y_ret - Y_base)
+
+Holding context/similarity fixed, increasing U_h or D_h cannot increase g_h
+or change another horizon's gate. Detached gate evidence prevents the base
+or adapter from changing predictions solely to manipulate confidence.
+Consensus is an agreement signal, not a guarantee that retrieved futures
+are accurate. Both new mechanisms can be disabled to reproduce ctx1.
 
 Training uses MSE(Y_pred, Y) + retrieval_base_loss_weight * MSE(Y_base, Y).
 W_r learns through this forecast loss; a separate future-similarity objective
@@ -67,6 +79,8 @@ class RetrievedFuture(NamedTuple):
     similarity_stats: Optional[torch.Tensor] = None  # [B,N,4]: mean,max,std,gap
     future_variance: Optional[torch.Tensor] = None   # [B,N,H], valid-K population variance
     past_std: Optional[torch.Tensor] = None          # [B,N,K], historical input std
+    global_candidate_count: Optional[torch.Tensor] = None  # [B], after causal/global filtering
+    global_similarity: Optional[torch.Tensor] = None       # [B,N,1], selected weighted global cosine
 
 
 class Model(OriginalITransformer):
@@ -85,9 +99,13 @@ class Model(OriginalITransformer):
         self.retrieval_reliability_gate = bool(getattr(configs, 'retrieval_reliability_gate', True))
         self.retrieval_base_loss_weight = float(getattr(configs, 'retrieval_base_loss_weight', 0.2))
         self.retrieval_contextual = bool(getattr(configs, 'retrieval_contextual', True))
+        self.retrieval_global_filter = bool(getattr(configs, 'retrieval_global_filter', True))
+        self.retrieval_global_top_k = int(getattr(configs, 'retrieval_global_top_k', 64))
+        self.retrieval_consensus_gate = bool(getattr(configs, 'retrieval_consensus_gate', True))
         if min(self.seq_len, self.pred_len, self.retrieval_top_k,
                self.retrieval_memory_size, self.retrieval_stride,
-               self.retrieval_chunk_size, self.retrieval_variable_chunk_size) < 1:
+               self.retrieval_chunk_size, self.retrieval_variable_chunk_size,
+               self.retrieval_global_top_k) < 1:
             raise ValueError('Retrieval lengths, sizes, stride and top_k must be positive')
         if not math.isfinite(self.retrieval_temperature) or self.retrieval_temperature <= 0:
             raise ValueError('retrieval_temperature must be finite and positive')
@@ -97,20 +115,25 @@ class Model(OriginalITransformer):
         d_model = configs.d_model
         # Learn reliability in prediction space: one gate per variable/horizon.
         # Nonzero final weights let both MLP layers learn from the first step.
-        gate_inputs = d_model + (4 + 2 * self.pred_len if self.retrieval_reliability_gate else 1)
+        consensus = self.retrieval_consensus_gate and self.retrieval_reliability_gate
+        gate_inputs = d_model + (4 if consensus else
+                                 4 + 2 * self.pred_len if self.retrieval_reliability_gate else 1)
         self.prediction_gate = nn.Sequential(
             nn.Linear(gate_inputs, d_model), nn.GELU(),
-            nn.Linear(d_model, self.pred_len),
+            nn.Linear(d_model, 1 if consensus else self.pred_len),
         )
         nn.init.normal_(self.prediction_gate[-1].weight, std=0.02)
         nn.init.constant_(self.prediction_gate[-1].bias, -2.0)
+        if consensus:
+            # Positive penalties enforce decreasing trust as disagreement grows.
+            self.consensus_penalty = nn.Parameter(torch.zeros(2))
         # No bias: an identical past must preserve its observed continuation.
         # Zero initialization starts with the existing retrieval forecast.
         self.continuation_adapter = nn.Linear(self.seq_len, self.pred_len, bias=False)
         nn.init.zeros_(self.continuation_adapter.weight)
         self.retrieval_projection = (nn.Linear(d_model, d_model, bias=False)
-                                     if self.retrieval_contextual else nn.Identity())
-        if self.retrieval_contextual:
+                                     if self.retrieval_contextual or self.retrieval_global_filter else nn.Identity())
+        if self.retrieval_contextual or self.retrieval_global_filter:
             nn.init.eye_(self.retrieval_projection.weight)
         self.register_buffer('memory_series', torch.empty(0, 0))
         self.register_buffer('memory_starts', torch.empty(0, dtype=torch.long))
@@ -120,6 +143,7 @@ class Model(OriginalITransformer):
         # load_state_dict updates made while a model remains in eval mode.
         self._key_cache = None
         self._context_cache = None
+        self._global_key_cache = None
         self._key_cache_version = None
 
     @torch.no_grad()
@@ -150,6 +174,7 @@ class Model(OriginalITransformer):
         self.memory_scale = series.new_empty(0)
         self._key_cache = None
         self._context_cache = None
+        self._global_key_cache = None
         self._key_cache_version = None
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
@@ -163,6 +188,7 @@ class Model(OriginalITransformer):
                 setattr(self, name, current.new_empty(value.shape))
         self._key_cache = None
         self._context_cache = None
+        self._global_key_cache = None
         self._key_cache_version = None
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                      missing_keys, unexpected_keys, error_msgs)
@@ -171,6 +197,7 @@ class Model(OriginalITransformer):
         if mode:
             self._key_cache = None
             self._context_cache = None
+            self._global_key_cache = None
             self._key_cache_version = None
         return super().train(mode)
 
@@ -225,7 +252,7 @@ class Model(OriginalITransformer):
         return self.encode_retrieval_context(past)
 
     def _encode_keys(self, start, stop, first_var, last_var):
-        if self.retrieval_contextual:
+        if self.retrieval_contextual and not self.retrieval_global_filter:
             context = self._history_context(start, stop)
             return F.normalize(self.retrieval_projection(context[:, first_var:last_var]).float(), dim=-1)
         past, _ = self._windows(
@@ -235,7 +262,17 @@ class Model(OriginalITransformer):
         return F.normalize(self.enc_embedding.value_embedding(past).float(), dim=-1)
 
     @torch.no_grad()
-    def _select_neighbors(self, query, query_end, first_var):
+    def _select_global_candidates(self, query_context, query_end):
+        """Causal masking precedes global Top-G, shared by all variables."""
+        scores = F.normalize(query_context.float(), dim=-1) @ self._global_key_cache.T
+        if query_end is not None:
+            ends = self.memory_starts + self.seq_len + self.pred_len
+            scores = scores.masked_fill(ends[None, :] > query_end[:, None], -torch.inf)
+        scores, indices = scores.topk(min(self.retrieval_global_top_k, scores.size(-1)), dim=-1)
+        return indices, torch.isfinite(scores)
+
+    @torch.no_grad()
+    def _select_neighbors(self, query, query_end, first_var, candidates=None):
         """Chunked cosine Top-K, independently for each [batch, variable]."""
         batch, variables, _ = query.shape
         count = self.memory_starts.numel()
@@ -243,6 +280,14 @@ class Model(OriginalITransformer):
         best_scores = query.new_empty(batch, variables, 0, dtype=torch.float32)
         best_indices = torch.empty(batch, variables, 0, dtype=torch.long, device=query.device)
         query = F.normalize(query.float(), dim=-1)
+        if candidates is not None:
+            indices, valid = candidates
+            keys = self._key_cache[indices, first_var:first_var + variables]
+            scores = torch.einsum('bnd,bgnd->bng', query, keys)
+            scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
+            scores, positions = scores.topk(min(k, indices.size(-1)), dim=-1)
+            indices = indices[:, None, :].expand(-1, variables, -1).gather(-1, positions)
+            return indices, torch.isfinite(scores)
         for start in range(0, count, self.retrieval_chunk_size):
             stop = min(start + self.retrieval_chunk_size, count)
             if self._key_cache is None:
@@ -269,12 +314,14 @@ class Model(OriginalITransformer):
         """
         return future + self.continuation_adapter(query_past.unsqueeze(2) - past)
 
-    def retrieve(self, query_tokens, query_end=None, query_past=None):
+    def retrieve(self, query_tokens, query_end=None, query_past=None, query_context=None):
         """Return futures, neighbors and reliability statistics (see RetrievedFuture).
 
         Invalid neighbors have index -1 and weight zero. The discrete Top-K
         search has no gradient; selected keys and similarity weights are
-        recomputed with gradients. In contextual mode pass W_r-projected
+        recomputed with gradients. Global filtering takes local past tokens
+        plus W_r-projected pooled query_context [B,D]. Without global filtering,
+        contextual mode takes W_r-projected
         encode_retrieval_context outputs; otherwise pass past embeddings. Pass
         normalized query_past [B,N,L] to adapt historical continuations.
         Omitting query_past exposes the raw historical retrieval for inspection.
@@ -285,6 +332,9 @@ class Model(OriginalITransformer):
             raise ValueError('Query variable count/order must match the training memory')
         if query_past is not None and query_past.shape != (*query_tokens.shape[:2], self.seq_len):
             raise ValueError('query_past must have shape [B,N,seq_len]')
+        if self.retrieval_global_filter and (query_context is None or
+                                             query_context.shape != (query_tokens.size(0), query_tokens.size(-1))):
+            raise ValueError('Global filtering requires projected query_context [B,D]')
         if query_end is None and self.training:
             raise ValueError('Training retrieval requires query_end to prevent future leakage')
         if query_end is not None:
@@ -296,15 +346,30 @@ class Model(OriginalITransformer):
         with torch.autocast(device_type=query_tokens.device.type, enabled=False):
             projection = self.enc_embedding.value_embedding
             key_parameters = list(projection.parameters())
-            if self.retrieval_contextual:
+            if self.retrieval_contextual or self.retrieval_global_filter:
                 key_parameters += list(self.encoder.parameters()) + list(self.retrieval_projection.parameters())
             version = (tuple((id(p), p._version) for p in key_parameters),
                        self.memory_series._version, self.memory_starts._version,
-                       query_tokens.device, projection.weight.dtype, self.use_norm, self.retrieval_contextual)
+                       query_tokens.device, projection.weight.dtype, self.use_norm,
+                       self.retrieval_contextual, self.retrieval_global_filter)
             if self.training or self._key_cache is None or self._key_cache_version != version:
                 with torch.no_grad():
                     chunks = range(0, self.memory_starts.numel(), self.retrieval_chunk_size)
-                    if self.retrieval_contextual:
+                    if self.retrieval_global_filter:
+                        contexts, local_keys = [], []
+                        for start in chunks:
+                            stop = min(start + self.retrieval_chunk_size, self.memory_starts.numel())
+                            past, _ = self._windows(self.memory_starts[start:stop, None],
+                                                   torch.arange(query_tokens.size(1), device=query_tokens.device)[None],
+                                                   include_future=False)
+                            local = projection(past)
+                            context = self.encode_retrieval_context(past) if self.retrieval_contextual else local
+                            contexts.append(context.mean(1))
+                            local_keys.append(F.normalize(local.float(), dim=-1))
+                        self._context_cache = torch.cat(contexts, dim=0)
+                        self._global_key_cache = F.normalize(self.retrieval_projection(self._context_cache).float(), dim=-1)
+                        self._key_cache = torch.cat(local_keys, dim=0)
+                    elif self.retrieval_contextual:
                         self._context_cache = torch.cat([
                             self._history_context(start, min(start + self.retrieval_chunk_size,
                                                              self.memory_starts.numel()))
@@ -318,17 +383,23 @@ class Model(OriginalITransformer):
                                               0, query_tokens.size(1))
                             for start in chunks], dim=0)
                 self._key_cache_version = version
+            candidates = (self._select_global_candidates(query_context, query_end)
+                          if self.retrieval_global_filter else None)
             futures, all_indices, all_weights, similarities = [], [], [], []
             statistics, variances, past_stds = [], [], []
+            global_similarities = []
             for first in range(0, query_tokens.size(1), self.retrieval_variable_chunk_size):
                 last = min(first + self.retrieval_variable_chunk_size, query_tokens.size(1))
                 query = query_tokens[:, first:last].float()
-                indices, valid = self._select_neighbors(query, query_end, first)
+                indices, valid = self._select_neighbors(query, query_end, first, candidates)
                 channels = torch.arange(first, last, device=query.device)[None, :, None]
                 past, future, past_std = self._windows(self.memory_starts[indices], channels, return_std=True)
                 if query_past is not None:
                     future = self._adapt_futures(query_past[:, first:last].float(), past, future)
-                if self.retrieval_contextual:
+                if self.retrieval_global_filter:
+                    # Local matching preserves the variable's own trajectory.
+                    past_token = projection(past).detach()
+                elif self.retrieval_contextual:
                     # Stop-gradient memory contexts avoid retaining the whole
                     # bank's encoder graph. Selected W_r keys remain trainable.
                     past_token = self.retrieval_projection(self._context_cache[indices, channels])
@@ -336,6 +407,13 @@ class Model(OriginalITransformer):
                     past_token = projection(past)
                 scores = (F.normalize(query, dim=-1).unsqueeze(2)
                           * F.normalize(past_token.float(), dim=-1)).sum(-1)
+                if self.retrieval_global_filter:
+                    global_keys = self.retrieval_projection(self._context_cache[indices])
+                    global_scores = (F.normalize(query_context.float(), dim=-1)[:, None, None, :]
+                                     * F.normalize(global_keys.float(), dim=-1)).sum(-1)
+                    # Global compatibility remains a differentiable prior after
+                    # local Top-K selection. The average retains cosine scale.
+                    scores = 0.5 * (scores + global_scores)
                 if self.retrieval_weighted:
                     logits = (scores / self.retrieval_temperature).masked_fill(~valid, -torch.inf)
                     # All-masked queries must yield zero retrieval, not NaN.
@@ -343,6 +421,8 @@ class Model(OriginalITransformer):
                     weights = logits.softmax(-1) * valid
                 else:
                     weights = valid.float() / valid.sum(-1, keepdim=True).clamp_min(1)
+                if self.retrieval_global_filter:
+                    global_similarities.append((weights * global_scores).sum(-1, keepdim=True))
                 futures.append((weights.unsqueeze(-1) * future).sum(2))
                 similarities.append((weights * scores).sum(-1, keepdim=True))
                 # Unweighted statistics over VALID neighbors: even a low-weight
@@ -364,7 +444,9 @@ class Model(OriginalITransformer):
             return RetrievedFuture(torch.cat(futures, dim=1), torch.cat(all_indices, dim=1),
                                    torch.cat(all_weights, dim=1), torch.cat(similarities, dim=1),
                                    torch.cat(statistics, dim=1), torch.cat(variances, dim=1),
-                                   torch.cat(past_stds, dim=1))
+                                   torch.cat(past_stds, dim=1),
+                                   candidates[1].sum(-1) if candidates is not None else None,
+                                   torch.cat(global_similarities, dim=1) if global_similarities else None)
 
     def fuse_prediction(self, base_prediction, current_tokens, retrieved, return_gate=False):
         """Fuse [B,N,H] forecasts in the same units, with [B,N,D] past tokens.
@@ -375,7 +457,17 @@ class Model(OriginalITransformer):
         retains the backbone, including when the gate network has biases.
         """
         if self.retrieval_use_gate:
-            if self.retrieval_reliability_gate:
+            if self.retrieval_consensus_gate and self.retrieval_reliability_gate:
+                if retrieved.similarity_stats is None or retrieved.future_variance is None:
+                    raise ValueError('Consensus gate requires similarity_stats and future_variance')
+                context = torch.cat((current_tokens.detach(),
+                                     retrieved.similarity_stats.detach().to(current_tokens.dtype)), dim=-1)
+                confidence = self.prediction_gate(context).float()
+                uncertainty = torch.log1p(retrieved.future_variance.detach().float().clamp_min(0))
+                disagreement = torch.log1p((retrieved.future.detach().float() - base_prediction.detach().float()).abs())
+                penalties = F.softplus(self.consensus_penalty.float())
+                gate = torch.sigmoid(confidence - penalties[0] * uncertainty - penalties[1] * disagreement)
+            elif self.retrieval_reliability_gate:
                 if retrieved.similarity_stats is None or retrieved.future_variance is None:
                     raise ValueError('Reliability gate requires similarity_stats and future_variance')
                 # These features use the same normalized units as both forecasts.
@@ -385,8 +477,9 @@ class Model(OriginalITransformer):
                                          torch.log1p((retrieved.future - base_prediction).abs())), dim=-1)
             else:
                 reliability = retrieved.similarity
-            context = torch.cat((current_tokens, reliability.to(current_tokens.dtype)), dim=-1)
-            gate = torch.sigmoid(self.prediction_gate(context))
+            if not (self.retrieval_consensus_gate and self.retrieval_reliability_gate):
+                context = torch.cat((current_tokens, reliability.to(current_tokens.dtype)), dim=-1)
+                gate = torch.sigmoid(self.prediction_gate(context))
         else:
             gate = torch.ones_like(base_prediction)
         available = (retrieved.indices >= 0).any(-1, keepdim=True)
@@ -424,7 +517,15 @@ class Model(OriginalITransformer):
         # and queries for selecting historical cases during training.
         tokens = self.enc_embedding.value_embedding(inputs)
         encoded = self.enc_embedding.dropout(tokens)
-        if self.retrieval_contextual:
+        query_context = None
+        if self.retrieval_global_filter:
+            with torch.autocast(device_type=x_enc.device.type, enabled=False):
+                with torch.no_grad():
+                    query_tokens = self.enc_embedding.value_embedding(normalized.permute(0, 2, 1).float())
+                    retrieval_context = (self.encode_retrieval_context(normalized.permute(0, 2, 1))
+                                         if self.retrieval_contextual else query_tokens)
+                query_context = self.retrieval_projection(retrieval_context.mean(1))
+        elif self.retrieval_contextual:
             # Keep metric-learning gradients in W_r. Forecast loss still trains
             # the encoder normally through base_prediction below.
             with torch.no_grad():
@@ -434,7 +535,7 @@ class Model(OriginalITransformer):
         else:
             query_tokens = tokens[:, :variables]
         retrieved = self.retrieve(query_tokens, query_end,
-                                  query_past=normalized.permute(0, 2, 1))
+                                  query_past=normalized.permute(0, 2, 1), query_context=query_context)
         # Forecast attention sees only the current window and its covariates.
         encoded, attention = self.encoder(encoded, attn_mask=None)
         base_prediction = self.projector(encoded)[:, :variables]
@@ -467,6 +568,9 @@ class Model(OriginalITransformer):
                               candidate_count=counts, similarity=retrieved.similarity.detach().squeeze(-1),
                               scale_ratio_mean=ratio_mean, scale_ratio_max=ratio_max,
                               future_variance=retrieved.future_variance.detach().permute(0, 2, 1))
+            if retrieved.global_candidate_count is not None:
+                components['global_candidate_count'] = retrieved.global_candidate_count[:, None].expand(-1, variables)
+                components['global_similarity'] = retrieved.global_similarity.detach().squeeze(-1)
             return prediction, attention, components
         return prediction, attention
 
@@ -540,4 +644,10 @@ def retrieval_setting_suffix(configs):
                 ('retrieval_reliability_gate', 1), ('retrieval_base_loss_weight', 0.2)]
     suffix = '_vradapt{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}_rg{}_bl{}'.format(
         *(getattr(configs, name, default) for name, default in defaults))
-    return suffix + '_ctx1' if getattr(configs, 'retrieval_contextual', True) else suffix
+    if getattr(configs, 'retrieval_contextual', True):
+        suffix += '_ctx1'
+    if getattr(configs, 'retrieval_global_filter', True):
+        suffix += '_gc{}'.format(getattr(configs, 'retrieval_global_top_k', 64))
+    if getattr(configs, 'retrieval_consensus_gate', True):
+        suffix += '_cg1'
+    return suffix

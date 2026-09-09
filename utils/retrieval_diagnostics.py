@@ -47,6 +47,9 @@ class RetrievalDiagnostics:
                 key = name + '_' + suffix
                 total = values.sum((0, 1)).numpy()
                 self.channel_sums[key] = self.channel_sums.get(key, np.zeros_like(total)) + total
+            # Horizon quarters expose a good early forecast hiding a poor tail.
+            for segment, values in enumerate(torch.tensor_split(square, 4, dim=1), 1):
+                record(name + '_mse_q' + str(segment), values)
             if name == 'retrieval':
                 mask = available[:, None, :].expand_as(square)
                 record('retrieval_available_mse', square[mask])
@@ -56,8 +59,13 @@ class RetrievalDiagnostics:
         self.channel_count += target.size(0) * target.size(1)
         record('available_fraction', available)
         record('candidate_count', components['candidate_count'][:, start:])
+        if 'global_candidate_count' in components:
+            record('global_candidate_count', components['global_candidate_count'][:, start:])
+            record('global_similarity', components['global_similarity'][:, start:].detach().cpu()[available])
         record('mean_similarity', components['similarity'][:, start:].detach().cpu()[available])
         record('mean_gate', components['gate'][:, :, start:])
+        for segment, values in enumerate(torch.tensor_split(components['gate'][:, :, start:], 4, dim=1), 1):
+            record('mean_gate_q' + str(segment), values)
         record('future_variance', components['future_variance'][:, :, start:].detach().cpu()[
             available[:, None, :].expand(-1, components['future_variance'].size(1), -1)])
         ratios = components['scale_ratio_mean'][:, start:].detach().double().cpu()[available]
@@ -87,6 +95,14 @@ def print_retrieval_summary(label, summary):
     values = ['{} MSE={:.6f} MAE={:.6f}'.format(name, summary[name + '_mse'], summary[name + '_mae'])
               for name in ('base', 'retrieval', 'fused')]
     print('Retrieval {}: {}'.format(label, ' | '.join(values)))
+    if 'fused_mse_q1' in summary:
+        def quarters(prefix):
+            return ','.join('n/a' if summary[prefix + str(i)] is None else
+                            '{:.4f}'.format(summary[prefix + str(i)]) for i in range(1, 5))
+        candidates = (' | global candidates={:.1f}'.format(summary['global_candidate_count'])
+                      if 'global_candidate_count' in summary else '')
+        print('Retrieval {} horizon quarters: fused MSE=[{}] | gate=[{}]{}'.format(
+            label, quarters('fused_mse_q'), quarters('mean_gate_q'), candidates))
 
 
 def save_retrieval_diagnostics(directory, summaries, rows=None):

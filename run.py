@@ -95,6 +95,12 @@ if __name__ == '__main__':
     parser.add_argument('--retrieval_contextual', type=int, choices=[0, 1], default=1,
                         help='Use multivariate encoder context and a dedicated retrieval projection; 0 restores embedding retrieval')
     parser.add_argument('--retrieval_top_k', type=int, default=8)
+    parser.add_argument('--retrieval_global_filter', type=int, choices=[0, 1], default=1,
+                        help='Filter by global window context before variable-specific Top-K')
+    parser.add_argument('--retrieval_global_top_k', type=int, default=64,
+                        help='Maximum causal historical windows kept by the global filter')
+    parser.add_argument('--retrieval_consensus_gate', type=int, choices=[0, 1], default=1,
+                        help='Horizon-shared gate with monotone variance/disagreement penalties')
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)
     parser.add_argument('--retrieval_memory_size', type=int, default=1024)
     parser.add_argument('--retrieval_stride', type=int, default=1)
