@@ -2,8 +2,15 @@
 
 Each variable independently retrieves the same variable's historical (X, Y)
 pairs using past embeddings. The original iTransformer produces Y_base;
-weighted historical futures produce Y_ret. A horizon-wise gate conditioned
-on current state, similarity statistics, future disagreement and the difference
+historical futures are adapted to the current past before producing Y_ret:
+
+    Y_ret = sum_k w_k * [Y_k + A(X_query - X_k)]
+
+A is a shared, bias-free temporal linear map initialized to zero. It learns
+how differences between past windows change their continuations, instead of
+assuming similar past embeddings imply interchangeable futures. The same
+adapted neighbors supply the gate's disagreement statistics. A horizon-wise
+gate conditioned on current state, similarity statistics, future disagreement and the difference
 between base/retrieval predictions combines the predictions:
 
     Y_pred = Y_base + sigmoid(MLP([z, reliability])) * (Y_ret - Y_base)
@@ -85,6 +92,10 @@ class Model(OriginalITransformer):
         )
         nn.init.normal_(self.prediction_gate[-1].weight, std=0.02)
         nn.init.constant_(self.prediction_gate[-1].bias, -2.0)
+        # No bias: an identical past must preserve its observed continuation.
+        # Zero initialization starts with the existing retrieval forecast.
+        self.continuation_adapter = nn.Linear(self.seq_len, self.pred_len, bias=False)
+        nn.init.zeros_(self.continuation_adapter.weight)
         self.register_buffer('memory_series', torch.empty(0, 0))
         self.register_buffer('memory_starts', torch.empty(0, dtype=torch.long))
         self.register_buffer('memory_mean', torch.empty(0))
@@ -191,18 +202,30 @@ class Model(OriginalITransformer):
             best_indices = indices.gather(-1, positions)
         return best_indices, torch.isfinite(best_scores)
 
-    def retrieve(self, query_tokens, query_end=None):
+    def _adapt_futures(self, query_past, past, future):
+        """Transfer [B,N,K,H] continuations using past differences only.
+
+        All inputs share the window-normalized coordinates used by retrieval
+        (or model input units when normalization is off). The map is shared
+        across variables/neighbors and never receives current future labels.
+        """
+        return future + self.continuation_adapter(query_past.unsqueeze(2) - past)
+
+    def retrieve(self, query_tokens, query_end=None, query_past=None):
         """Return futures, neighbors and reliability statistics (see RetrievedFuture).
 
         Invalid neighbors have index -1 and weight zero. The discrete Top-K
         search has no gradient; selected keys and similarity weights are
-        recomputed with gradients. Values are observed historical futures,
-        without a future-to-token projection. Pass pre-dropout past embeddings.
+        recomputed with gradients. Pass pre-dropout past embeddings and
+        normalized query_past [B,N,L] to adapt historical continuations.
+        Omitting query_past exposes the raw historical retrieval for inspection.
         """
         if not self.memory_starts.numel():
             raise RuntimeError('Retrieval memory is empty; call build_memory(train_series) first')
         if query_tokens.ndim != 3 or query_tokens.size(1) != self.memory_series.size(1):
             raise ValueError('Query variable count/order must match the training memory')
+        if query_past is not None and query_past.shape != (*query_tokens.shape[:2], self.seq_len):
+            raise ValueError('query_past must have shape [B,N,seq_len]')
         if query_end is None and self.training:
             raise ValueError('Training retrieval requires query_end to prevent future leakage')
         if query_end is not None:
@@ -235,6 +258,8 @@ class Model(OriginalITransformer):
                 indices, valid = self._select_neighbors(query, query_end, first)
                 channels = torch.arange(first, last, device=query.device)[None, :, None]
                 past, future, past_std = self._windows(self.memory_starts[indices], channels, return_std=True)
+                if query_past is not None:
+                    future = self._adapt_futures(query_past[:, first:last].float(), past, future)
                 past_token = projection(past)
                 scores = (F.normalize(query, dim=-1).unsqueeze(2)
                           * F.normalize(past_token.float(), dim=-1)).sum(-1)
@@ -326,7 +351,8 @@ class Model(OriginalITransformer):
         # and queries for selecting historical cases during training.
         tokens = self.enc_embedding.value_embedding(inputs)
         encoded = self.enc_embedding.dropout(tokens)
-        retrieved = self.retrieve(tokens[:, :variables], query_end)
+        retrieved = self.retrieve(tokens[:, :variables], query_end,
+                                  query_past=normalized.permute(0, 2, 1))
         # Only the current window and its covariates enter self-attention.
         encoded, attention = self.encoder(encoded, attn_mask=None)
         base_prediction = self.projector(encoded)[:, :variables]
@@ -424,11 +450,11 @@ def align_retrieval_prediction_data(model, dataset):
 
 
 def retrieval_setting_suffix(configs):
-    """Version reliability-gate checkpoints and distinguish loss ablations."""
+    """Version continuation-adapter checkpoints and distinguish loss ablations."""
     defaults = [('use_retrieval', 1), ('retrieval_top_k', 8),
                 ('retrieval_temperature', 0.1), ('retrieval_memory_size', 1024),
                 ('retrieval_stride', 1), ('retrieval_use_future', 1),
                 ('retrieval_use_gate', 1), ('retrieval_weighted', 1),
                 ('retrieval_reliability_gate', 1), ('retrieval_base_loss_weight', 0.2)]
-    return '_vrrel{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}_rg{}_bl{}'.format(
+    return '_vradapt{}_k{}_t{}_m{}_s{}_f{}_g{}_w{}_rg{}_bl{}'.format(
         *(getattr(configs, name, default) for name, default in defaults))
