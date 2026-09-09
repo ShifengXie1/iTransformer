@@ -7,19 +7,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 # Historical pairs come only from the training split. Training sample indices
 # enforce memory_start + seq_len + pred_len <= current_start + seq_len.
-# Defaults to all four horizons with both models. PRED_LENS can override the list.
+# Defaults to retrieval only at all four horizons. PRED_LENS can override the list.
 # Past embeddings select neighbors. A shared, zero-initialized temporal map
 # adapts each continuation: Y_ret = sum_k w_k [Y_k + A(X_current - X_k)].
 # Adapted futures fuse in prediction space: Y_pred = Y_base + gate * (Y_ret - Y_base).
 # A run evaluates base (g=0), retrieval (g=1) and fused forecasts together.
-# MODELS="itransformer_retrieval" skips standalone baseline training.
+# Standalone baseline training is skipped; compare against the paper's results.
 # RETRIEVAL_BASE_LOSS_WEIGHT=0 and RETRIEVAL_RELIABILITY_GATE=0 are ablations.
 # USE_RETRIEVAL=0 or RETRIEVAL_USE_FUTURE=0: original backbone;
 # RETRIEVAL_USE_GATE=0: adapted retrieved forecast wherever history is available;
 # RETRIEVAL_WEIGHTED=0: uniform Top-K. No history always uses the backbone.
 PYTHON="${PYTHON:-python}"
 read -r -a horizons <<< "${PRED_LENS:-96 192 336 720}"
-read -r -a models <<< "${MODELS:-iTransformer itransformer_retrieval}"
+read -r -a models <<< "${MODELS:-itransformer_retrieval}"
 for pred_len in "${horizons[@]}"; do
   case "$pred_len" in
     96|192) width=256 ;;
