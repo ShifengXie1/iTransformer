@@ -39,6 +39,9 @@ Consensus is an agreement signal, not a guarantee that retrieved futures
 are accurate. Both new mechanisms can be disabled to reproduce ctx1.
 
 Training uses MSE(Y_pred, Y) + retrieval_base_loss_weight * MSE(Y_base, Y).
+With retrieval_isolate_backbone=True, fusion uses stop_gradient(Y_base), and
+all retrieval/gate paths into backbone parameters are detached. The backbone
+then learns only through its auxiliary loss; forward predictions are unchanged.
 W_r learns through this forecast loss; a separate future-similarity objective
 is not part of this implementation.
 forward(..., return_components=True) returns differentiable branch forecasts
@@ -109,6 +112,7 @@ class Model(OriginalITransformer):
         self.retrieval_disagreement_penalty = bool(getattr(configs, 'retrieval_disagreement_penalty', True))
         self.retrieval_local_candidates = bool(getattr(configs, 'retrieval_local_candidates', True))
         self.retrieval_horizon_gate = bool(getattr(configs, 'retrieval_horizon_gate', True))
+        self.retrieval_isolate_backbone = bool(getattr(configs, 'retrieval_isolate_backbone', False))
         if min(self.seq_len, self.pred_len, self.retrieval_top_k,
                self.retrieval_memory_size, self.retrieval_stride,
                self.retrieval_chunk_size, self.retrieval_variable_chunk_size,
@@ -118,6 +122,9 @@ class Model(OriginalITransformer):
             raise ValueError('retrieval_temperature must be finite and positive')
         if not math.isfinite(self.retrieval_base_loss_weight) or self.retrieval_base_loss_weight < 0:
             raise ValueError('retrieval_base_loss_weight must be finite and nonnegative')
+        if (self.retrieval_isolate_backbone and self.use_retrieval and self.retrieval_use_future
+                and self.retrieval_base_loss_weight == 0):
+            raise ValueError('Backbone isolation requires retrieval_base_loss_weight > 0')
 
         d_model = configs.d_model
         # Learn reliability in prediction space: one gate per variable/horizon.
@@ -431,6 +438,8 @@ class Model(OriginalITransformer):
                     past_token = self.retrieval_projection(self._context_cache[indices, channels])
                 else:
                     past_token = projection(past)
+                    if self.retrieval_isolate_backbone:
+                        past_token = past_token.detach()
                 scores = (F.normalize(query, dim=-1).unsqueeze(2)
                           * F.normalize(past_token.float(), dim=-1)).sum(-1)
                 if self.retrieval_global_filter:
@@ -482,6 +491,11 @@ class Model(OriginalITransformer):
         Y_ret wherever history is available. Unavailable history always
         retains the backbone, including when the gate network has biases.
         """
+        if self.retrieval_isolate_backbone:
+            # Keep the original base tensor in forecast components for its own
+            # loss. Detach here also covers the no-history fallback and old gates.
+            base_prediction = base_prediction.detach()
+            current_tokens = current_tokens.detach()
         if self.retrieval_use_gate:
             if self.retrieval_consensus_gate and self.retrieval_reliability_gate:
                 if retrieved.similarity_stats is None or retrieved.future_variance is None:
@@ -569,6 +583,8 @@ class Model(OriginalITransformer):
                 query_tokens = self.retrieval_projection(retrieval_context)
         else:
             query_tokens = tokens[:, :variables]
+            if self.retrieval_isolate_backbone:
+                query_tokens = query_tokens.detach()
         retrieved = self.retrieve(query_tokens, query_end,
                                   query_past=normalized.permute(0, 2, 1), query_context=query_context)
         # Forecast attention sees only the current window and its covariates.
@@ -618,7 +634,7 @@ class Model(OriginalITransformer):
         return (prediction, attention) if self.output_attention else prediction
 
     def base_auxiliary_loss(self, components, target):
-        """Use gathered, non-detached forecasts; supports M, MS and DataParallel."""
+        """Train the backbone (its sole loss when isolated); supports M/MS/DP."""
         if not self.use_retrieval or not self.retrieval_use_future or self.retrieval_base_loss_weight == 0:
             return target.new_zeros(())
         base = components['base'][:, -target.size(1):, -target.size(2):]
@@ -691,4 +707,6 @@ def retrieval_setting_suffix(configs):
         if (getattr(configs, 'retrieval_reliability_gate', True)
                 and getattr(configs, 'retrieval_horizon_gate', True)):
             suffix += '_hg1'
+    if getattr(configs, 'retrieval_isolate_backbone', False):
+        suffix += '_iso1'
     return suffix

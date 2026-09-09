@@ -10,6 +10,8 @@ Compare adapted, previous full, local candidates only, position gate only,
 and both changes. Previous six variant names retain their original settings.
   python scripts/validate_retrieval_architecture.py
   python scripts/validate_retrieval_architecture.py --horizons 720
+Gradient isolation comparison (both disable the position gate; 8 fresh runs):
+  python scripts/validate_retrieval_architecture.py --variants local_candidates local_isolated
 
 Validation/test cover every window without shuffling or dropping the last batch.
 This differs from run.py's shuffled validation subset. Compare variants within
@@ -46,6 +48,7 @@ VARIANTS = {
     'local_candidates': 'Variable-specific causal Top-K with global weighting; previous consensus gate',
     'horizon_only': 'Previous full retrieval with position-aware consensus gate',
     'local_horizon': 'Local candidates + global weighting + position-aware consensus gate',
+    'local_isolated': 'Local candidates and previous consensus gate; backbone trained only by auxiliary loss',
 }
 
 DEFAULT_VARIANTS = ['adapted', 'full', 'local_candidates', 'horizon_only', 'local_horizon']
@@ -110,8 +113,9 @@ def make_config(args, horizon, variant):
         retrieval_use_future=True, retrieval_use_gate=True, retrieval_weighted=True,
         retrieval_reliability_gate=True, retrieval_contextual=variant != 'adapted',
         retrieval_global_filter=new_structure, retrieval_consensus_gate=new_structure,
-        retrieval_local_candidates=variant in ('local_candidates', 'local_horizon'),
+        retrieval_local_candidates=variant in ('local_candidates', 'local_horizon', 'local_isolated'),
         retrieval_horizon_gate=variant in ('horizon_only', 'local_horizon'),
+        retrieval_isolate_backbone=variant == 'local_isolated',
         retrieval_disagreement_penalty=variant not in ('no_disagreement', 'all_candidates_no_disagreement'),
         retrieval_global_top_k=args.global_top_k, retrieval_top_k=args.top_k,
         retrieval_memory_size=args.memory_size, retrieval_temperature=args.temperature,

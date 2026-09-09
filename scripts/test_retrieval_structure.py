@@ -168,6 +168,57 @@ class ArchitectureChecks(unittest.TestCase):
         self.assertTrue(suffixes[0].endswith('_gc64_cg1'))
         self.assertTrue(suffixes[-1].endswith('_lc1_cg1_hg1'))
 
+    def test_isolation_blocks_all_backbone_paths_but_trains_retrieval_and_gate(self):
+        for contextual, global_context, consensus in ((False, False, False),
+                                                       (True, False, False),
+                                                       (True, True, False),
+                                                       (True, True, True)):
+            with self.subTest(contextual=contextual, global_context=global_context, consensus=consensus):
+                model = self.model(retrieval_isolate_backbone=True, retrieval_horizon_gate=False,
+                                   retrieval_contextual=contextual, retrieval_global_filter=global_context,
+                                   retrieval_consensus_gate=consensus)
+                parts = model(torch.randn(2, 4, 2), None, None, None,
+                              query_end=torch.tensor([4, 40]), return_components=True)
+                target = torch.randn_like(parts['prediction'])
+                fused_loss = (parts['prediction'] - target).square().mean()
+                backbone = list(model.enc_embedding.parameters()) + list(model.encoder.parameters()) + list(model.projector.parameters())
+                gradients = torch.autograd.grad(fused_loss, backbone, allow_unused=True, retain_graph=True)
+                self.assertTrue(all(g is None or g.count_nonzero() == 0 for g in gradients))
+                heads = [model.continuation_adapter.weight, model.prediction_gate[-1].weight]
+                if contextual or global_context:
+                    heads.append(model.retrieval_projection.weight)
+                gradients = torch.autograd.grad(fused_loss, heads, retain_graph=True)
+                self.assertTrue(all(torch.isfinite(g).all() and g.abs().sum() > 0 for g in gradients))
+                # Auxiliary training still reaches backbone for both M and MS.
+                for feature_start in (0, -1):
+                    auxiliary = model.base_auxiliary_loss(parts, target[:, :, feature_start:])
+                    own = torch.autograd.grad(auxiliary, backbone, retain_graph=True)
+                    combined = torch.autograd.grad(auxiliary + fused_loss, backbone, retain_graph=True)
+                    for expected, actual in zip(own, combined):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertGreater(sum(g.abs().sum().item() for g in own), 0.)
+
+    def test_isolation_preserves_forward_and_fallback_with_same_weights(self):
+        model = self.model(retrieval_horizon_gate=False).eval()
+        x, ends = torch.randn(2, 4, 2), torch.tensor([4, 40])
+        expected = model(x, None, None, None, query_end=ends, return_components=True)
+        model.retrieval_isolate_backbone = True
+        actual = model(x, None, None, None, query_end=ends, return_components=True)
+        for name in ('prediction', 'base', 'retrieval', 'gate'):
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+        torch.testing.assert_close(actual['prediction'][0], actual['base'][0], rtol=0, atol=0)
+
+    def test_isolation_comparison_changes_only_gradient_routing(self):
+        args = parser().parse_args(['--variants', 'local_candidates', 'local_isolated'])
+        normal = make_config(args, 96, 'local_candidates')
+        isolated = make_config(args, 96, 'local_isolated')
+        differences = [key for key in vars(normal) if getattr(normal, key) != getattr(isolated, key)]
+        self.assertEqual(differences, ['retrieval_isolate_backbone'])
+        self.assertFalse(isolated.retrieval_horizon_gate)
+        self.assertEqual(retrieval_setting_suffix(isolated), retrieval_setting_suffix(normal) + '_iso1')
+        with self.assertRaisesRegex(ValueError, 'base_loss_weight > 0'):
+            Model(config(retrieval_isolate_backbone=True, retrieval_base_loss_weight=0))
+
 
 if __name__ == '__main__':
     unittest.main()

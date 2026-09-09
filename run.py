@@ -105,6 +105,8 @@ if __name__ == '__main__':
                         help='Horizon-shared gate with monotone variance/disagreement penalties')
     parser.add_argument('--retrieval_horizon_gate', type=int, choices=[0, 1], default=1,
                         help='Learn a context-dependent smooth confidence curve over forecast positions')
+    parser.add_argument('--retrieval_isolate_backbone', type=int, choices=[0, 1], default=0,
+                        help='Train backbone only with its auxiliary loss; stop fusion/retrieval gradients into it')
     parser.add_argument('--retrieval_disagreement_penalty', type=int, choices=[0, 1], default=1,
                         help='Penalize base/retrieval disagreement in the consensus gate; 0 is a training ablation')
     parser.add_argument('--retrieval_temperature', type=float, default=0.1)
