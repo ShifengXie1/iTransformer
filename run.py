@@ -20,14 +20,10 @@ from model.itransformer_retrieval import retrieval_setting_suffix
 from model.iTransformer_pl import period_lag_setting_suffix
 
 if __name__ == '__main__':
-    fix_seed = 2023
-    random.seed(fix_seed)
-    torch.manual_seed(fix_seed)
-    np.random.seed(fix_seed)
-
     parser = argparse.ArgumentParser(description='iTransformer')
 
     # basic config
+    parser.add_argument('--seed', type=int, default=2023, help='shared reproducibility seed for comparisons')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
@@ -107,6 +103,12 @@ if __name__ == '__main__':
     parser.add_argument('--retrieval_use_gate', type=int, choices=[0, 1], default=1,
                         help='learn horizon-wise prediction gates; 0 uses retrieved forecasts when available')
     parser.add_argument('--retrieval_weighted', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--retrieval_reliability_gate', type=int, choices=[0, 1], default=1,
+                        help='use similarity statistics, future variance and base/retrieval disagreement')
+    parser.add_argument('--retrieval_base_loss_weight', type=float, default=0.2,
+                        help='weight of auxiliary MSE on the jointly trained base forecast; 0 disables')
+    parser.add_argument('--retrieval_diagnostics', type=int, choices=[0, 1], default=1,
+                        help='save branch MSE/MAE, batch reliability statistics and training curves')
     # Context-conditioned low-rank output calibration
     parser.add_argument('--calibration_rank', type=int, default=8)
     parser.add_argument('--calibration_hidden', type=int, default=32)
@@ -254,6 +256,10 @@ if __name__ == '__main__':
                                                                            'you can select [partial_start_index, min(enc_in + partial_start_index, N)]')
 
     args = parser.parse_args()
+    fix_seed = args.seed
+    random.seed(fix_seed)
+    torch.manual_seed(fix_seed)
+    np.random.seed(fix_seed)
     # Reuse one timestamp for every artifact produced by this process so that
     # test plots, metrics and predictions from the same run stay grouped.
     args.run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

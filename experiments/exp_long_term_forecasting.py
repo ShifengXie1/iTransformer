@@ -3,6 +3,9 @@ from experiments.exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 from utils.periods import save_period_metadata
+from utils.retrieval_diagnostics import (
+    RetrievalDiagnostics, print_retrieval_summary, save_retrieval_diagnostics,
+)
 from model.itransformer_correlation import initialize_correlation_basis
 from model.itransformer_retrieval import initialize_retrieval_memory, align_retrieval_prediction_data
 import torch
@@ -48,9 +51,29 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         criterion = nn.MSELoss()
         return criterion
 
-    def _add_model_auxiliary_loss(self, loss, target, pred=None):
+    def _forecast_outputs(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, model_kwargs):
+        with torch.cuda.amp.autocast(enabled=self.args.use_amp):
+            if self.args.model == 'itransformer_retrieval':
+                components = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,
+                                        return_components=True, **model_kwargs)
+                return components['prediction'], components
+            output = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
+            return (output[0] if self.args.output_attention else output), None
+
+    def _new_retrieval_diagnostics(self, dataset=None):
+        if self.args.model != 'itransformer_retrieval' or not getattr(self.args, 'retrieval_diagnostics', True):
+            return None
+        f_dim = -1 if self.args.features == 'MS' else 0
+        scale = None
+        if dataset is not None and dataset.scale and self.args.inverse:
+            scale = dataset.scaler.scale_[f_dim:]
+        return RetrievalDiagnostics(f_dim, scale)
+
+    def _add_model_auxiliary_loss(self, loss, target, pred=None, components=None):
         """Use optional model-owned objectives without affecting baselines."""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        if components is not None:
+            loss = loss + model.base_auxiliary_loss(components, target)
         correlation_loss = getattr(model, 'compute_correlation_loss', None)
         if correlation_loss is not None and model.lambda_joint > 0:
             loss = loss + model.lambda_joint * correlation_loss(pred, target)
@@ -64,6 +87,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         total_loss = []
         delay_totals = {}
         delay_samples = 0
+        retrieval_diagnostics = self._new_retrieval_diagnostics()
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(vali_loader):
@@ -80,18 +104,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
+                outputs, components = self._forecast_outputs(
+                    batch_x, batch_x_mark, dec_inp, batch_y_mark, model_kwargs)
                 # Scalar diagnostics require no attention tensors or extra pass.
                 # DataParallel replicas do not persist Python-side summaries.
                 delay_metrics = getattr(self.model, 'delay_metrics', None)
@@ -108,6 +122,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 true = batch_y.detach().cpu()
 
                 loss = criterion(pred, true)
+                if retrieval_diagnostics is not None:
+                    retrieval_diagnostics.update(components, batch_y)
 
                 total_loss.append(loss)
         total_loss = np.average(total_loss)
@@ -116,6 +132,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             print('Delay {}: {}'.format(diagnostic_label, ' '.join(
                 '{}={:.6g}'.format(name, value) for name, value in summary.items())))
         self.model.train()
+        self._last_retrieval_validation = (retrieval_diagnostics.summary()
+                                           if retrieval_diagnostics is not None else None)
+        print_retrieval_summary(diagnostic_label, self._last_retrieval_validation)
         return total_loss
 
     def train(self, setting):
@@ -151,9 +170,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
 
+        retrieval_rows, retrieval_epochs = [], []
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
+            retrieval_diagnostics = self._new_retrieval_diagnostics()
 
             self.model.train()
             epoch_time = time.time()
@@ -174,32 +195,18 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
-
-                        f_dim = -1 if self.args.features == 'MS' else 0
-                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
-                        loss = self._add_model_auxiliary_loss(loss, batch_y, outputs)
-                        train_loss.append(loss.item())
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
-
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                outputs, components = self._forecast_outputs(
+                    batch_x, batch_x_mark, dec_inp, batch_y_mark, model_kwargs)
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                with torch.cuda.amp.autocast(enabled=self.args.use_amp):
                     loss = criterion(outputs, batch_y)
-                    loss = self._add_model_auxiliary_loss(loss, batch_y, outputs)
-                    train_loss.append(loss.item())
+                    loss = self._add_model_auxiliary_loss(loss, batch_y, outputs, components)
+                train_loss.append(loss.item())
+                if retrieval_diagnostics is not None:
+                    row = retrieval_diagnostics.update(components, batch_y)
+                    retrieval_rows.append(dict(epoch=epoch + 1, batch=i + 1, **row))
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -220,7 +227,16 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
+            retrieval_val = self._last_retrieval_validation
             test_loss = self.vali(test_data, test_loader, criterion, diagnostic_label='test')
+            if retrieval_diagnostics is not None:
+                train_summary = retrieval_diagnostics.summary()
+                print_retrieval_summary('train', train_summary)
+                retrieval_epochs.append(dict(epoch=epoch + 1, train=train_summary,
+                                             validation=retrieval_val, test=self._last_retrieval_validation))
+                run_stamp = getattr(self.args, 'run_timestamp', 'current')
+                save_retrieval_diagnostics(os.path.join(path, 'diagnostics', run_stamp),
+                                           retrieval_epochs, retrieval_rows)
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))
@@ -246,6 +262,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         preds = []
         trues = []
+        retrieval_diagnostics = self._new_retrieval_diagnostics(test_data)
         run_timestamp = getattr(self.args, 'run_timestamp', time.strftime('%Y%m%d_%H%M%S'))
         folder_path = os.path.join('./test_results', setting, run_timestamp)
         if not os.path.exists(folder_path):
@@ -268,23 +285,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
-
+                outputs, components = self._forecast_outputs(
+                    batch_x, batch_x_mark, dec_inp, batch_y_mark, model_kwargs)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                if retrieval_diagnostics is not None:
+                    retrieval_diagnostics.update(components, batch_y)
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
                 if test_data.scale and self.args.inverse:
@@ -342,6 +349,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         np.save(os.path.join(folder_path, 'metrics.npy'), np.array([mae, mse, rmse, mape, mspe]))
         np.save(os.path.join(folder_path, 'pred.npy'), preds)
         np.save(os.path.join(folder_path, 'true.npy'), trues)
+        if retrieval_diagnostics is not None:
+            summary = retrieval_diagnostics.summary()
+            print_retrieval_summary('test checkpoint', summary)
+            save_retrieval_diagnostics(folder_path, summary)
 
         return
 
@@ -371,18 +382,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
-                # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.args.output_attention:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
-                else:
-                    if self.args.output_attention:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)[0]
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, **model_kwargs)
+                outputs, components = self._forecast_outputs(
+                    batch_x, batch_x_mark, dec_inp, batch_y_mark, model_kwargs)
                 outputs = outputs.detach().cpu().numpy()
                 if pred_data.scale and self.args.inverse:
                     shape = outputs.shape
