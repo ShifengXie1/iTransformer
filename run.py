@@ -148,6 +148,10 @@ if __name__ == '__main__':
     parser.add_argument('--dual_variable_chunk_size', type=int, default=32)
     parser.add_argument('--dual_memory_batch_size', type=int, default=128)
     parser.add_argument('--dual_search_metric', choices=['l2', 'cosine'], default='l2')
+    parser.add_argument('--dual_shape_bins', type=int, default=24,
+                        help='fine bins in the multi-scale normalized-shape retrieval key')
+    parser.add_argument('--dual_shape_weight', type=float, default=0.5,
+                        help='shape-key share in local/global retrieval scores')
     parser.add_argument('--dual_global_weight', type=float, default=0.5,
                         help='initial global-context share when weighting the candidate union')
     parser.add_argument('--dual_use_global', type=int, choices=[0, 1], default=1)
@@ -158,12 +162,18 @@ if __name__ == '__main__':
                         help='optional extra gap after a memory target; 0 is already causal')
     parser.add_argument('--dual_horizon_gate', type=int, choices=[0, 1], default=1)
     parser.add_argument('--dual_scale_residual', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_learned_gate', type=int, choices=[0, 1], default=0,
+                        help='learn a neural gate; 0 uses robust validation-calibrated residual shrinkage')
     parser.add_argument('--dual_train_metric', type=int, choices=[0, 1], default=0,
                         help='learn full retrieval projections; disabled by default to reduce overfitting')
     parser.add_argument('--dual_utility_loss_weight', type=float, default=0.1,
                         help='oracle shrinkage supervision for the residual reliability gate')
     parser.add_argument('--dual_gamma_grid', type=str, default='0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1',
                         help='validation-only global correction strengths; must include values in [0,1]')
+    parser.add_argument('--dual_calibration_blocks', type=int, default=4,
+                        help='number of horizon blocks calibrated separately for every variable')
+    parser.add_argument('--dual_min_validation_gain', type=float, default=0.001,
+                        help='minimum relative validation MSE gain required to enable a block correction')
     # Context-conditioned low-rank output calibration
     parser.add_argument('--calibration_rank', type=int, default=8)
     parser.add_argument('--calibration_hidden', type=int, default=32)

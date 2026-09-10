@@ -177,10 +177,14 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return square_error / elements
 
     def _select_dual_gamma(self, loader, gamma_grid):
-        """Select one global shrinkage value using validation data only."""
+        """Calibrate conservative variable-by-horizon-block shrinkage."""
         core = self._dual_core()
         core.set_gamma(1.)
-        totals = {gamma: 0. for gamma in gamma_grid}
+        horizon = self.args.pred_len
+        block_count = self.args.dual_calibration_blocks
+        edges = np.linspace(0, horizon, block_count + 1, dtype=int)
+        grid = torch.as_tensor(gamma_grid, device=self.device, dtype=torch.float64)
+        totals = None
         elements = 0
         feature_start = -1 if self.args.features == 'MS' else 0
         self.model.eval()
@@ -192,14 +196,45 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 mixture = components['retrieval'][:, -self.args.pred_len:, feature_start:].float()
                 target = y[:, -self.args.pred_len:, feature_start:].float()
                 delta = mixture - base
-                for gamma in gamma_grid:
-                    totals[gamma] += (base + gamma * delta - target).square().sum().item()
+                if totals is None:
+                    totals = torch.zeros(
+                        len(gamma_grid), block_count, target.size(-1),
+                        device=self.device, dtype=torch.float64)
+                for block, (start, stop) in enumerate(zip(edges[:-1], edges[1:])):
+                    candidate = (
+                        base[:, start:stop].double().unsqueeze(0) +
+                        grid[:, None, None, None] *
+                        delta[:, start:stop].double().unsqueeze(0))
+                    error = candidate - target[:, start:stop].double().unsqueeze(0)
+                    totals[:, block] += error.square().sum((1, 2))
                 elements += target.numel()
-        # gamma_grid is sorted so min breaks exact ties toward the safer value.
-        best_gamma = min(gamma_grid, key=lambda gamma: (totals[gamma], gamma))
-        core.set_gamma(best_gamma)
+        if totals is None or elements == 0:
+            raise RuntimeError('Cannot calibrate dual retrieval on an empty validation loader')
+
+        # The sorted grid and argmin break exact ties toward smaller correction.
+        zero_index = gamma_grid.index(0.)
+        best_indices = totals.argmin(0)
+        best_sse = totals.gather(0, best_indices.unsqueeze(0)).squeeze(0)
+        base_sse = totals[zero_index]
+        relative_gain = (base_sse - best_sse) / base_sse.clamp_min(1e-12)
+        enabled = relative_gain >= self.args.dual_min_validation_gain
+        selected_indices = torch.where(
+            enabled, best_indices, torch.full_like(best_indices, zero_index))
+        selected_gamma = grid[selected_indices]
+        selected_sse = totals.gather(0, selected_indices.unsqueeze(0)).squeeze(0)
+
+        gamma_map = torch.zeros_like(core.dual_gamma)
+        for block, (start, stop) in enumerate(zip(edges[:-1], edges[1:])):
+            gamma_map[0, feature_start:, start:stop] = (
+                selected_gamma[block].float().unsqueeze(-1))
+        core.set_gamma(gamma_map)
         self.model.train()
-        return best_gamma, totals[best_gamma] / elements
+        calibration = dict(
+            mean_gamma=float(selected_gamma.mean().item()),
+            active_fraction=float((selected_gamma > 0).float().mean().item()),
+            block_gamma=selected_gamma.detach().cpu().tolist(),
+            block_relative_gain=relative_gain.detach().cpu().tolist())
+        return calibration, float(selected_sse.sum().item() / elements)
 
     def _train_dual_retrieval(self, setting):
         """Two-stage training for stable base-specific dual memories."""
@@ -211,6 +246,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         if not gamma_grid or any(not np.isfinite(value) or value < 0 or value > 1
                                  for value in gamma_grid):
             raise ValueError('dual_gamma_grid must contain comma-separated values in [0,1]')
+        if 0. not in gamma_grid:
+            raise ValueError('dual_gamma_grid must include 0 for exact base fallback')
+        if not 1 <= self.args.dual_calibration_blocks <= self.args.pred_len:
+            raise ValueError('dual_calibration_blocks must lie in [1, pred_len]')
+        if (not np.isfinite(self.args.dual_min_validation_gain) or
+                self.args.dual_min_validation_gain < 0):
+            raise ValueError('dual_min_validation_gain must be finite and nonnegative')
 
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
@@ -277,13 +319,32 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             self.model, train_data, train_loader,
             use_time_marks=not ('PEMS' in self.args.data or 'Solar' in self.args.data))
         print('Dual memory windows:', core.memory_starts.numel())
+        history = list(base_history)
+        if not core.dual_learned_gate:
+            started = time.time()
+            calibration, validation = self._select_dual_gamma(vali_loader, gamma_grid)
+            self.vali(vali_data, vali_loader, self._select_criterion())
+            row = dict(
+                stage='calibrated_retrieval', epoch=0, train_loss=None,
+                validation_mse=validation, seconds=time.time() - started,
+                **calibration)
+            history.append(row)
+            with open(history_path, 'w', encoding='utf-8') as stream:
+                json.dump(history, stream, indent=2, allow_nan=False)
+            torch.save(self.model.state_dict(), os.path.join(path, 'checkpoint.pth'))
+            print('Dual calibrated retrieval | vali {:.7f} mean gamma {:.3f} '
+                  'active blocks {:.1%} time {:.1f}s'.format(
+                      validation, calibration['mean_gamma'],
+                      calibration['active_fraction'], row['seconds']))
+            return self.model
+
         retrieval_lr = self.args.dual_retrieval_learning_rate or self.args.learning_rate
         trainable = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
         if not trainable:
             raise RuntimeError('Dual retrieval stage has no trainable parameters')
         optimizer = optim.Adam(trainable, lr=retrieval_lr)
         scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
-        best, stale, history = float('inf'), 0, list(base_history)
+        best, stale = float('inf'), 0
         for epoch in range(1, self.args.train_epochs + 1):
             core.set_gamma(1.)
             self.model.train()
@@ -304,16 +365,19 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 scaler.step(optimizer)
                 scaler.update()
                 losses.append(loss.item())
-            gamma, validation = self._select_dual_gamma(vali_loader, gamma_grid)
+            calibration, validation = self._select_dual_gamma(vali_loader, gamma_grid)
             # Produce branch/gate diagnostics at the selected validation gamma.
             self.vali(vali_data, vali_loader, self._select_criterion())
             row = dict(stage='retrieval', epoch=epoch, train_loss=float(np.mean(losses)),
-                       validation_mse=validation, gamma=gamma, seconds=time.time() - started)
+                       validation_mse=validation, seconds=time.time() - started,
+                       **calibration)
             history.append(row)
             with open(history_path, 'w', encoding='utf-8') as stream:
                 json.dump(history, stream, indent=2, allow_nan=False)
-            print('Dual retrieval epoch {} | train {:.7f} vali {:.7f} gamma {:.2f} time {:.1f}s'.format(
-                epoch, row['train_loss'], validation, gamma, row['seconds']))
+            print('Dual retrieval epoch {} | train {:.7f} vali {:.7f} mean gamma {:.3f} '
+                  'active blocks {:.1%} time {:.1f}s'.format(
+                      epoch, row['train_loss'], validation, calibration['mean_gamma'],
+                      calibration['active_fraction'], row['seconds']))
             if validation < best:
                 best, stale = validation, 0
                 torch.save(self.model.state_dict(), os.path.join(path, 'checkpoint.pth'))
@@ -327,7 +391,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         self.model.load_state_dict(
             torch.load(os.path.join(path, 'checkpoint.pth'), map_location=self.device), strict=True)
-        print('Selected dual gamma:', float(core.dual_gamma.item()))
+        print('Selected dual gamma mean:', float(core.dual_gamma.mean().item()),
+              'active fraction:', float((core.dual_gamma > 0).float().mean().item()))
         return self.model
 
     def train(self, setting):

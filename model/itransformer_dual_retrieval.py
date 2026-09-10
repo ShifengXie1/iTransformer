@@ -8,20 +8,20 @@ evidence.  Direct future retrieval remains available only as an ablation:
 * a query-adapted historical continuation (future expert), and
 * a scale-transported historical base-model error (residual expert).
 
-Local variable keys and pooled multivariate context each contribute candidates;
-their union prevents either view from hiding useful evidence from the other.  A
-conservative gate shrinks the retrieved residual toward the frozen base for
-every sample, variable and horizon.  Nonnegative uncertainty and disagreement
-penalties make an expert's logit monotonically decrease as its evidence becomes
-less reliable.  An optional smooth horizon basis changes confidence without
-introducing H independent gate heads.
+Final hidden states and normalized multi-scale shapes retrieve complementary
+local-variable and global-regime candidates.  Their union prevents either view
+from hiding useful evidence from the other.  By default, validation calibrates
+a small correction table over variables and horizon blocks; any block without a
+minimum measured gain falls back exactly to the frozen base.  A learned gate
+with monotone uncertainty penalties remains available as an ablation.
 
 Training is intentionally staged.  Train the backbone normally, freeze it,
-build the memory from that exact checkpoint, and then train only the retrieval
-projections, continuation transport and gate.  Replacing the backbone invalidates
-both residual values and keys and therefore requires rebuilding the memory.
+build the memory from that exact checkpoint, and calibrate retrieval without
+updating the backbone.  Replacing the backbone invalidates both residual values
+and keys and therefore requires rebuilding the memory.
 """
 
+import hashlib
 import math
 from typing import NamedTuple, Optional
 
@@ -64,11 +64,15 @@ class Model(OriginalITransformer):
         self.dual_scale_residual = bool(getattr(configs, 'dual_scale_residual', True))
         self.dual_train_metric = bool(getattr(configs, 'dual_train_metric', False))
         self.dual_utility_loss_weight = float(getattr(configs, 'dual_utility_loss_weight', 0.1))
+        self.dual_learned_gate = bool(getattr(configs, 'dual_learned_gate', False))
+        self.dual_shape_bins = int(getattr(configs, 'dual_shape_bins', 24))
+        self.dual_shape_weight = float(getattr(configs, 'dual_shape_weight', 0.5))
         self.dual_causal_gap = int(getattr(configs, 'dual_causal_gap', 0))
 
         positive = (self.dual_top_k, self.dual_stride, self.dual_chunk_size,
                     self.dual_variable_chunk_size, self.dual_memory_batch_size)
-        if (min(positive) < 1 or self.dual_global_top_k < 0 or
+        if (min(positive) < 1 or self.dual_shape_bins < 1 or
+                self.dual_shape_bins > self.seq_len or self.dual_global_top_k < 0 or
                 self.dual_memory_size < 0 or self.dual_causal_gap < 0):
             raise ValueError('Dual retrieval sizes must be positive; memory_size and causal_gap may be zero')
         if not math.isfinite(self.dual_temperature) or self.dual_temperature <= 0:
@@ -80,6 +84,11 @@ class Model(OriginalITransformer):
         if (not math.isfinite(self.dual_utility_loss_weight) or
                 self.dual_utility_loss_weight < 0):
             raise ValueError('dual_utility_loss_weight must be finite and nonnegative')
+        if not math.isfinite(self.dual_shape_weight) or not 0 <= self.dual_shape_weight <= 1:
+            raise ValueError('dual_shape_weight must lie in [0, 1]')
+        if not self.dual_learned_gate and (self.dual_use_future or not self.dual_use_residual):
+            raise ValueError('The calibrated gate requires residual-only retrieval; '
+                             'enable dual_learned_gate for future-expert ablations')
 
         d_model = configs.d_model
         self.local_projection = nn.Linear(d_model, d_model, bias=False)
@@ -126,6 +135,8 @@ class Model(OriginalITransformer):
 
         self.register_buffer('memory_keys', torch.empty(0, 0, 0))
         self.register_buffer('memory_global_keys', torch.empty(0, 0))
+        self.register_buffer('memory_shape_keys', torch.empty(0, 0, 0))
+        self.register_buffer('memory_global_shape_keys', torch.empty(0, 0))
         self.register_buffer('memory_past', torch.empty(0, 0, 0))
         self.register_buffer('memory_future', torch.empty(0, 0, 0))
         self.register_buffer('memory_residual', torch.empty(0, 0, 0))
@@ -134,7 +145,8 @@ class Model(OriginalITransformer):
         self.register_buffer('memory_mean', torch.empty(0))
         self.register_buffer('memory_scale', torch.empty(0))
         self.register_buffer('memory_ready', torch.tensor(False))
-        self.register_buffer('dual_gamma', torch.tensor(1.0))
+        self.register_buffer(
+            'dual_gamma', torch.ones(1, int(configs.enc_in), self.pred_len))
 
     @property
     def retrieval_ready(self):
@@ -166,6 +178,11 @@ class Model(OriginalITransformer):
         for name, parameter in self.named_parameters():
             if not name.startswith(('enc_embedding.', 'encoder.', 'projector.')):
                 parameter.requires_grad_(True)
+        if not self.dual_learned_gate:
+            for name, parameter in self.named_parameters():
+                if not name.startswith(('enc_embedding.', 'encoder.', 'projector.')):
+                    parameter.requires_grad_(False)
+            return
         # The frozen encoder already defines a useful metric.  Learning two
         # unrestricted D x D transforms from a small retrieval-calibration set
         # is optional because it can easily overfit benchmark datasets.
@@ -191,7 +208,8 @@ class Model(OriginalITransformer):
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
-        for name in ('memory_keys', 'memory_global_keys', 'memory_past',
+        for name in ('memory_keys', 'memory_global_keys', 'memory_shape_keys',
+                     'memory_global_shape_keys', 'memory_past',
                      'memory_future', 'memory_residual', 'memory_past_std',
                      'memory_starts', 'memory_mean', 'memory_scale'):
             value = state_dict.get(prefix + name)
@@ -231,6 +249,15 @@ class Model(OriginalITransformer):
             base = base * stdev + means
         return base, keys, normalized.permute(0, 2, 1), means, stdev, attention
 
+    def _shape_descriptor(self, normalized_past):
+        """Compact level-invariant multi-scale shape key for retrieval."""
+        fine = F.adaptive_avg_pool1d(normalized_past.float(), self.dual_shape_bins)
+        coarse_bins = max(1, self.dual_shape_bins // 4)
+        coarse = F.adaptive_avg_pool1d(normalized_past.float(), coarse_bins)
+        differences = normalized_past[..., 1:].float() - normalized_past[..., :-1].float()
+        slope = F.adaptive_avg_pool1d(differences, coarse_bins)
+        return torch.cat((fine, coarse, slope), -1)
+
     @torch.no_grad()
     def build_memory(self, memory_x, memory_y, memory_x_mark=None, starts=None):
         """Encode a frozen-backbone memory from aligned training samples.
@@ -264,7 +291,7 @@ class Model(OriginalITransformer):
             for parameter in module.parameters():
                 parameter.requires_grad_(False)
 
-        keys, pasts, futures, residuals, past_stds = [], [], [], [], []
+        keys, shapes, pasts, futures, residuals, past_stds = [], [], [], [], [], []
         for first in range(0, memory_x.size(0), self.dual_memory_batch_size):
             last = min(first + self.dual_memory_batch_size, memory_x.size(0))
             x = memory_x[first:last].to(device=device, dtype=dtype)
@@ -279,10 +306,13 @@ class Model(OriginalITransformer):
             if self.dual_use_residual:
                 residuals.append((y - base).permute(0, 2, 1).detach())
             keys.append(key.detach())
+            shapes.append(self._shape_descriptor(normalized).detach())
             past_stds.append(stdev.squeeze(1).detach())
 
         self.memory_keys = torch.cat(keys, 0)
         self.memory_global_keys = self.memory_keys.mean(1)
+        self.memory_shape_keys = torch.cat(shapes, 0)
+        self.memory_global_shape_keys = self.memory_shape_keys.mean(1)
         self.memory_past = (torch.cat(pasts, 0) if pasts else
                             torch.empty(0, device=device, dtype=dtype))
         self.memory_future = (torch.cat(futures, 0) if futures else
@@ -295,10 +325,15 @@ class Model(OriginalITransformer):
         self.set_retrieval_stage()
 
     def set_gamma(self, value):
-        value = float(value)
-        if not math.isfinite(value) or not 0 <= value <= 1:
+        value = torch.as_tensor(
+            value, device=self.dual_gamma.device, dtype=self.dual_gamma.dtype)
+        if value.ndim == 0:
+            value = value.expand_as(self.dual_gamma)
+        if value.shape != self.dual_gamma.shape:
+            raise ValueError('dual gamma must be scalar or have shape [1, variables, pred_len]')
+        if not torch.isfinite(value).all() or (value < 0).any() or (value > 1).any():
             raise ValueError('dual gamma must lie in [0, 1]')
-        self.dual_gamma.fill_(value)
+        self.dual_gamma.copy_(value)
 
     def _score(self, query, keys):
         if self.dual_search_metric == 'cosine':
@@ -307,7 +342,7 @@ class Model(OriginalITransformer):
         return -(query.float() - keys.float()).square().mean(-1)
 
     @torch.no_grad()
-    def _select_neighbors(self, query_keys, query_end, first_var):
+    def _select_neighbors(self, query_keys, query_shapes, query_end, first_var):
         batch, variables, _ = query_keys.shape
         count = self.memory_starts.numel()
         k = min(self.dual_top_k, count)
@@ -316,11 +351,22 @@ class Model(OriginalITransformer):
         for start in range(0, count, self.dual_chunk_size):
             stop = min(start + self.dual_chunk_size, count)
             keys = self.memory_keys[start:stop, first_var:first_var + variables]
+            shape_keys = self.memory_shape_keys[
+                start:stop, first_var:first_var + variables]
             if self.dual_search_metric == 'cosine':
-                scores = torch.einsum('bnd,mnd->bnm', F.normalize(query_keys.float(), dim=-1),
-                                      F.normalize(keys.float(), dim=-1))
+                hidden_scores = torch.einsum(
+                    'bnd,mnd->bnm', F.normalize(query_keys.float(), dim=-1),
+                    F.normalize(keys.float(), dim=-1))
+                shape_scores = torch.einsum(
+                    'bnp,mnp->bnm', F.normalize(query_shapes.float(), dim=-1),
+                    F.normalize(shape_keys.float(), dim=-1))
             else:
-                scores = -(query_keys.float().unsqueeze(2) - keys.float().permute(1, 0, 2).unsqueeze(0)).square().mean(-1)
+                hidden_scores = -(query_keys.float().unsqueeze(2) -
+                                  keys.float().permute(1, 0, 2).unsqueeze(0)).square().mean(-1)
+                shape_scores = -(query_shapes.float().unsqueeze(2) -
+                                 shape_keys.float().permute(1, 0, 2).unsqueeze(0)).square().mean(-1)
+            scores = ((1 - self.dual_shape_weight) * hidden_scores +
+                      self.dual_shape_weight * shape_scores)
             if query_end is not None:
                 availability = (self.memory_starts[start:stop] + self.seq_len +
                                 self.pred_len + self.dual_causal_gap)
@@ -334,7 +380,7 @@ class Model(OriginalITransformer):
         return best_indices, torch.isfinite(best_scores)
 
     @torch.no_grad()
-    def _select_global_neighbors(self, query_key, query_end):
+    def _select_global_neighbors(self, query_key, query_shape, query_end):
         """Retrieve pooled-regime neighbors without replacing local matches."""
         count = self.memory_starts.numel()
         k = min(self.dual_global_top_k, count)
@@ -348,13 +394,21 @@ class Model(OriginalITransformer):
         for start in range(0, count, self.dual_chunk_size):
             stop = min(start + self.dual_chunk_size, count)
             keys = self.memory_global_keys[start:stop]
+            shape_keys = self.memory_global_shape_keys[start:stop]
             if self.dual_search_metric == 'cosine':
-                scores = torch.einsum(
+                hidden_scores = torch.einsum(
                     'bd,md->bm', F.normalize(query_key.float(), dim=-1),
                     F.normalize(keys.float(), dim=-1))
+                shape_scores = torch.einsum(
+                    'bp,mp->bm', F.normalize(query_shape.float(), dim=-1),
+                    F.normalize(shape_keys.float(), dim=-1))
             else:
-                scores = -(query_key.float().unsqueeze(1) -
-                           keys.float().unsqueeze(0)).square().mean(-1)
+                hidden_scores = -(query_key.float().unsqueeze(1) -
+                                  keys.float().unsqueeze(0)).square().mean(-1)
+                shape_scores = -(query_shape.float().unsqueeze(1) -
+                                 shape_keys.float().unsqueeze(0)).square().mean(-1)
+            scores = ((1 - self.dual_shape_weight) * hidden_scores +
+                      self.dual_shape_weight * shape_scores)
             if query_end is not None:
                 availability = (self.memory_starts[start:stop] + self.seq_len +
                                 self.pred_len + self.dual_causal_gap)
@@ -382,9 +436,11 @@ class Model(OriginalITransformer):
         similarities, statistics, future_variances, residual_variances = [], [], [], []
         counts = []
         global_query = query_keys.mean(1)
+        query_shapes = self._shape_descriptor(query_past)
+        global_shape = query_shapes.mean(1)
         if self.dual_use_global and self.dual_global_top_k:
             global_indices, global_valid = self._select_global_neighbors(
-                global_query, query_end)
+                global_query, global_shape, query_end)
         else:
             global_indices = global_valid = None
         mix = (torch.sigmoid(self.global_weight_logit.float()) if self.dual_use_global
@@ -396,8 +452,9 @@ class Model(OriginalITransformer):
             for first in range(0, query_keys.size(1), self.dual_variable_chunk_size):
                 last = min(first + self.dual_variable_chunk_size, query_keys.size(1))
                 query = query_keys[:, first:last].float()
+                query_shape = query_shapes[:, first:last].float()
                 local_indices, local_valid = self._select_neighbors(
-                    query, query_end, first)
+                    query, query_shape, query_end, first)
                 indices, valid = local_indices, local_valid
                 if global_indices is not None:
                     regime_indices = global_indices[:, None, :].expand(
@@ -414,13 +471,24 @@ class Model(OriginalITransformer):
                 channels = torch.arange(first, last, device=query.device)[None, :, None]
 
                 selected_keys = self.memory_keys[safe_indices, channels]
-                local_scores = self._score(
+                selected_shapes = self.memory_shape_keys[safe_indices, channels]
+                local_hidden_scores = self._score(
                     self.local_projection(query).unsqueeze(2),
                     self.local_projection(selected_keys))
+                local_shape_scores = self._score(
+                    query_shape.unsqueeze(2), selected_shapes)
+                local_scores = ((1 - self.dual_shape_weight) * local_hidden_scores +
+                                self.dual_shape_weight * local_shape_scores)
                 selected_global = self.memory_global_keys[safe_indices]
-                global_scores = self._score(
+                selected_global_shapes = self.memory_global_shape_keys[safe_indices]
+                global_hidden_scores = self._score(
                     self.global_projection(global_query.float())[:, None, None, :],
                     self.global_projection(selected_global.float()))
+                global_shape_scores = self._score(
+                    global_shape.float()[:, None, None, :],
+                    selected_global_shapes.float())
+                global_scores = ((1 - self.dual_shape_weight) * global_hidden_scores +
+                                 self.dual_shape_weight * global_shape_scores)
                 scores = (1 - mix) * local_scores + mix * global_scores
                 logits = (scores / self.dual_temperature).masked_fill(~valid, -torch.inf)
                 logits = torch.where(valid.any(-1, keepdim=True), logits, torch.zeros_like(logits))
@@ -490,33 +558,51 @@ class Model(OriginalITransformer):
 
     def fuse_prediction(self, base, query_keys, evidence):
         available = (evidence.indices >= 0).any(-1, keepdim=True)
-        context = torch.cat((query_keys.detach(), evidence.similarity_stats.detach().to(query_keys.dtype)), -1)
-        hidden = self.expert_gate[1](self.expert_gate[0](context))
-        confidence = self.expert_gate[2](hidden).float().unsqueeze(2).expand(-1, -1, self.pred_len, -1)
-        if self.dual_horizon_gate:
-            horizon_coefficients = self.horizon_gate(hidden.float()).view(*hidden.shape[:2], 2, 3)
-            curve = torch.einsum('bnrc,ch->bnhr', horizon_coefficients, self.horizon_basis.float())
-            confidence = confidence + curve
-
         base_bnh = base.permute(0, 2, 1).float()
-        future_disagreement = (evidence.future.detach().float() - base_bnh.detach()).abs()
-        residual_disagreement = evidence.residual.detach().float().abs()
-        penalties = F.softplus(self.reliability_penalty.float())
-        future_logit = (confidence[..., 0]
-                        - penalties[0, 0] * torch.log1p(evidence.future_variance.detach().float().clamp_min(0))
-                        - penalties[0, 1] * torch.log1p(future_disagreement))
-        residual_logit = (confidence[..., 1]
-                          - penalties[1, 0] * torch.log1p(evidence.residual_variance.detach().float().clamp_min(0))
-                          - penalties[1, 1] * torch.log1p(residual_disagreement))
-        if not self.dual_use_future:
-            future_logit = torch.full_like(future_logit, -torch.inf)
-        if not self.dual_use_residual:
-            residual_logit = torch.full_like(residual_logit, -torch.inf)
-        logits = torch.stack((torch.zeros_like(future_logit), future_logit, residual_logit), -1)
-        gates = logits.softmax(-1)
-        fallback = torch.zeros_like(gates)
-        fallback[..., 0] = 1
-        gates = torch.where(available.unsqueeze(2), gates, fallback)
+        if self.dual_learned_gate:
+            context = torch.cat((
+                query_keys.detach(),
+                evidence.similarity_stats.detach().to(query_keys.dtype)), -1)
+            hidden = self.expert_gate[1](self.expert_gate[0](context))
+            confidence = self.expert_gate[2](hidden).float().unsqueeze(2).expand(
+                -1, -1, self.pred_len, -1)
+            if self.dual_horizon_gate:
+                horizon_coefficients = self.horizon_gate(hidden.float()).view(
+                    *hidden.shape[:2], 2, 3)
+                curve = torch.einsum(
+                    'bnrc,ch->bnhr', horizon_coefficients, self.horizon_basis.float())
+                confidence = confidence + curve
+
+            future_disagreement = (
+                evidence.future.detach().float() - base_bnh.detach()).abs()
+            residual_disagreement = evidence.residual.detach().float().abs()
+            penalties = F.softplus(self.reliability_penalty.float())
+            future_logit = (
+                confidence[..., 0]
+                - penalties[0, 0] * torch.log1p(
+                    evidence.future_variance.detach().float().clamp_min(0))
+                - penalties[0, 1] * torch.log1p(future_disagreement))
+            residual_logit = (
+                confidence[..., 1]
+                - penalties[1, 0] * torch.log1p(
+                    evidence.residual_variance.detach().float().clamp_min(0))
+                - penalties[1, 1] * torch.log1p(residual_disagreement))
+            if not self.dual_use_future:
+                future_logit = torch.full_like(future_logit, -torch.inf)
+            if not self.dual_use_residual:
+                residual_logit = torch.full_like(residual_logit, -torch.inf)
+            logits = torch.stack((
+                torch.zeros_like(future_logit), future_logit, residual_logit), -1)
+            gates = logits.softmax(-1)
+            fallback = torch.zeros_like(gates)
+            fallback[..., 0] = 1
+            gates = torch.where(available.unsqueeze(2), gates, fallback)
+        else:
+            # Parameter-free residual proposal.  Validation calibration below
+            # decides where and how strongly it may modify the frozen base.
+            residual_gate = available.expand(-1, -1, self.pred_len).float()
+            gates = torch.stack((
+                1 - residual_gate, torch.zeros_like(residual_gate), residual_gate), -1)
 
         future = torch.where(available, evidence.future, base_bnh)
         residual_prediction = torch.where(available, base_bnh + evidence.residual, base_bnh)
@@ -608,7 +694,8 @@ class Model(OriginalITransformer):
         future expert is enabled because then a single-expert oracle is not the
         correct target.
         """
-        if (self.dual_utility_loss_weight <= 0 or not self.dual_use_residual or
+        if (not self.dual_learned_gate or self.dual_utility_loss_weight <= 0 or
+                not self.dual_use_residual or
                 self.dual_use_future or components is None):
             return target.new_zeros(())
         horizon = target.size(1)
@@ -699,13 +786,16 @@ def align_dual_prediction_data(model, dataset):
 
 def dual_retrieval_setting_suffix(configs):
     gap = getattr(configs, 'dual_causal_gap', 0)
-    return '_dualret_k{}_gk{}_t{}_m{}_s{}_metric{}_tm{}_gw{}_ug{}_f{}_r{}_gap{}_hg{}_sr{}_ul{}'.format(
+    values = (
         getattr(configs, 'dual_top_k', 32),
         getattr(configs, 'dual_global_top_k', 32),
         getattr(configs, 'dual_temperature', 0.1),
         getattr(configs, 'dual_memory_size', 0),
         getattr(configs, 'dual_stride', 1),
         getattr(configs, 'dual_search_metric', 'l2'),
+        getattr(configs, 'dual_shape_bins', 24),
+        getattr(configs, 'dual_shape_weight', 0.5),
+        getattr(configs, 'dual_learned_gate', 0),
         getattr(configs, 'dual_train_metric', 0),
         getattr(configs, 'dual_global_weight', 0.5),
         getattr(configs, 'dual_use_global', 1),
@@ -713,4 +803,10 @@ def dual_retrieval_setting_suffix(configs):
         getattr(configs, 'dual_use_residual', 1), gap,
         getattr(configs, 'dual_horizon_gate', 1),
         getattr(configs, 'dual_scale_residual', 1),
-        getattr(configs, 'dual_utility_loss_weight', 0.1))
+        getattr(configs, 'dual_utility_loss_weight', 0.1),
+        getattr(configs, 'dual_calibration_blocks', 4),
+        getattr(configs, 'dual_min_validation_gain', 0.001))
+    digest = hashlib.sha1('|'.join(map(str, values)).encode('utf-8')).hexdigest()[:8]
+    return '_dcr_k{}_g{}_m{}_sw{}_lg{}_cb{}_mg{}_{}'.format(
+        values[0], values[1], values[3], values[7], values[8],
+        values[-2], values[-1], digest)

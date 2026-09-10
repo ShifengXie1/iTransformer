@@ -9,12 +9,12 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 # Two-stage conservative residual-retrieval experiment:
 #   A. train/select a standalone iTransformer;
-#   B. freeze it, build local/global keys plus residual memory, and train only
-#      the residual transport and reliability gate.
+#   B. freeze it, build hidden+shape local/global keys and residual memory;
+#   C. calibrate variable-by-horizon-block correction strengths on validation.
 # A candidate is already causal when its target ends before the query origin,
 # so the default extra causal gap is zero. Validation selects gamma from
 # DUAL_GAMMA_GRID, including gamma=0 as a complete base fallback.
-# Direct-future retrieval and full metric learning remain optional ablations.
+# Neural gating, direct-future retrieval and metric learning remain ablations.
 # Prefer the repository environment so this script can be launched directly.
 if [[ -z "${PYTHON:-}" ]]; then
   if [[ -x ".venv-retrieval/Scripts/python.exe" ]]; then
@@ -70,6 +70,8 @@ for seed in "${seeds[@]}"; do
       --dual_variable_chunk_size "${DUAL_VARIABLE_CHUNK_SIZE:-32}" \
       --dual_memory_batch_size "${DUAL_MEMORY_BATCH_SIZE:-128}" \
       --dual_search_metric "${DUAL_SEARCH_METRIC:-l2}" \
+      --dual_shape_bins "${DUAL_SHAPE_BINS:-24}" \
+      --dual_shape_weight "${DUAL_SHAPE_WEIGHT:-0.5}" \
       --dual_global_weight "${DUAL_GLOBAL_WEIGHT:-0.5}" \
       --dual_use_global "${DUAL_USE_GLOBAL:-1}" \
       --dual_use_future "${DUAL_USE_FUTURE:-0}" \
@@ -77,10 +79,13 @@ for seed in "${seeds[@]}"; do
       --dual_causal_gap "${DUAL_CAUSAL_GAP:-0}" \
       --dual_horizon_gate "${DUAL_HORIZON_GATE:-1}" \
       --dual_scale_residual "${DUAL_SCALE_RESIDUAL:-1}" \
+      --dual_learned_gate "${DUAL_LEARNED_GATE:-0}" \
       --dual_train_metric "${DUAL_TRAIN_METRIC:-0}" \
       --dual_utility_loss_weight "${DUAL_UTILITY_LOSS_WEIGHT:-0.1}" \
       --dual_gamma_grid "${DUAL_GAMMA_GRID:-0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1}" \
+      --dual_calibration_blocks "${DUAL_CALIBRATION_BLOCKS:-4}" \
+      --dual_min_validation_gain "${DUAL_MIN_VALIDATION_GAIN:-0.001}" \
       --retrieval_diagnostics "${RETRIEVAL_DIAGNOSTICS:-1}" \
-      --des "${DESCRIPTION:-DualRetrieval}"
+      --des "${DESCRIPTION:-CalibratedResidualRetrieval}"
   done
 done

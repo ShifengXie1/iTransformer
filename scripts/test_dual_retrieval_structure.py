@@ -23,7 +23,7 @@ from model.itransformer_dual_retrieval import (
 
 def config(**overrides):
     values = dict(
-        seq_len=8, pred_len=4, d_model=16, d_ff=16, n_heads=4,
+        seq_len=8, pred_len=4, enc_in=2, d_model=16, d_ff=16, n_heads=4,
         e_layers=1, dropout=0.1, embed='timeF', freq='h', factor=1,
         activation='gelu', class_strategy='projection', output_attention=False,
         use_norm=True, dual_top_k=3, dual_temperature=0.2,
@@ -33,7 +33,8 @@ def config(**overrides):
         dual_search_metric='l2', dual_global_weight=0.5,
         dual_use_global=True, dual_use_future=True, dual_use_residual=True,
         dual_causal_gap=0, dual_horizon_gate=True, dual_scale_residual=True,
-        dual_train_metric=True, dual_utility_loss_weight=0.1)
+        dual_train_metric=True, dual_utility_loss_weight=0.1,
+        dual_learned_gate=True, dual_shape_bins=4, dual_shape_weight=0.5)
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -152,6 +153,28 @@ class DualRetrievalChecks(unittest.TestCase):
         self.assertTrue(torch.equal(
             evidence.candidate_count, torch.full((1, 2), 2)))
         self.assertTrue((evidence.indices[..., 0] != evidence.indices[..., 1]).all())
+
+    def test_calibrated_mode_uses_exact_gamma_map_without_trainable_retrieval(self):
+        model = self.build_model(
+            dual_use_future=False, dual_learned_gate=False,
+            dual_train_metric=False).eval()
+        self.assertFalse(any(parameter.requires_grad for parameter in model.parameters()))
+        x = torch.randn(1, model.seq_len, 2)
+        ends = torch.tensor([100])
+        model.set_gamma(0)
+        base_parts = model(x, None, None, None, query_end=ends,
+                           return_components=True)
+        self.assertTrue(torch.equal(base_parts['prediction'], base_parts['base']))
+
+        gamma = torch.zeros_like(model.dual_gamma)
+        gamma[:, 0, :2] = 0.5
+        gamma[:, 1, 2:] = 1.0
+        model.set_gamma(gamma)
+        parts = model(x, None, None, None, query_end=ends,
+                      return_components=True)
+        expected = parts['base'] + gamma.permute(0, 2, 1) * (
+            parts['retrieval'] - parts['base'])
+        self.assertTrue(torch.allclose(parts['prediction'], expected, atol=1e-6))
 
     def test_dataset_initializer_preserves_training_positions(self):
         class ToyDataset(Dataset):
