@@ -8,9 +8,14 @@ from utils.retrieval_diagnostics import (
 )
 from model.itransformer_correlation import initialize_correlation_basis
 from model.itransformer_retrieval import initialize_retrieval_memory, align_retrieval_prediction_data
+from model.itransformer_dual_retrieval import (
+    initialize_dual_retrieval_memory, align_dual_prediction_data,
+)
 import torch
 import torch.nn as nn
 from torch import optim
+from torch.utils.data import DataLoader
+import json
 import os
 import time
 import warnings
@@ -53,7 +58,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
     def _forecast_outputs(self, batch_x, batch_x_mark, dec_inp, batch_y_mark, model_kwargs):
         with torch.cuda.amp.autocast(enabled=self.args.use_amp):
-            if self.args.model == 'itransformer_retrieval':
+            if self.args.model in ('itransformer_retrieval', 'itransformer_dual_retrieval'):
                 components = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,
                                         return_components=True, **model_kwargs)
                 return components['prediction'], components
@@ -61,7 +66,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             return (output[0] if self.args.output_attention else output), None
 
     def _new_retrieval_diagnostics(self, dataset=None):
-        if self.args.model != 'itransformer_retrieval' or not getattr(self.args, 'retrieval_diagnostics', True):
+        if (self.args.model not in ('itransformer_retrieval', 'itransformer_dual_retrieval')
+                or not getattr(self.args, 'retrieval_diagnostics', True)):
             return None
         f_dim = -1 if self.args.features == 'MS' else 0
         scale = None
@@ -137,7 +143,192 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         print_retrieval_summary(diagnostic_label, self._last_retrieval_validation)
         return total_loss
 
+    def _dual_core(self):
+        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+    def _dual_batch(self, batch):
+        batch_x, batch_y, batch_x_mark, batch_y_mark, model_kwargs = self._unpack_forecast_batch(batch)
+        batch_x = batch_x.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+        if 'PEMS' in self.args.data or 'Solar' in self.args.data:
+            batch_x_mark = None
+            batch_y_mark = None
+        else:
+            batch_x_mark = batch_x_mark.float().to(self.device)
+            batch_y_mark = batch_y_mark.float().to(self.device)
+        dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:]).float()
+        dec_inp = torch.cat(
+            (batch_y[:, :self.args.label_len], dec_inp), dim=1).to(self.device)
+        return batch_x, batch_y, batch_x_mark, batch_y_mark, dec_inp, model_kwargs
+
+    def _dual_base_validation(self, loader):
+        square_error, elements = 0., 0
+        self.model.eval()
+        feature_start = -1 if self.args.features == 'MS' else 0
+        with torch.no_grad():
+            for batch in loader:
+                x, y, x_mark, y_mark, dec_inp, kwargs = self._dual_batch(batch)
+                outputs, _ = self._forecast_outputs(x, x_mark, dec_inp, y_mark, kwargs)
+                outputs = outputs[:, -self.args.pred_len:, feature_start:]
+                target = y[:, -self.args.pred_len:, feature_start:]
+                square_error += (outputs.float() - target.float()).square().sum().item()
+                elements += target.numel()
+        self.model.train()
+        return square_error / elements
+
+    def _select_dual_gamma(self, loader, gamma_grid):
+        """Select one global shrinkage value using validation data only."""
+        core = self._dual_core()
+        core.set_gamma(1.)
+        totals = {gamma: 0. for gamma in gamma_grid}
+        elements = 0
+        feature_start = -1 if self.args.features == 'MS' else 0
+        self.model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                x, y, x_mark, y_mark, dec_inp, kwargs = self._dual_batch(batch)
+                _, components = self._forecast_outputs(x, x_mark, dec_inp, y_mark, kwargs)
+                base = components['base'][:, -self.args.pred_len:, feature_start:].float()
+                mixture = components['retrieval'][:, -self.args.pred_len:, feature_start:].float()
+                target = y[:, -self.args.pred_len:, feature_start:].float()
+                delta = mixture - base
+                for gamma in gamma_grid:
+                    totals[gamma] += (base + gamma * delta - target).square().sum().item()
+                elements += target.numel()
+        # gamma_grid is sorted so min breaks exact ties toward the safer value.
+        best_gamma = min(gamma_grid, key=lambda gamma: (totals[gamma], gamma))
+        core.set_gamma(best_gamma)
+        self.model.train()
+        return best_gamma, totals[best_gamma] / elements
+
+    def _train_dual_retrieval(self, setting):
+        """Two-stage training for stable base-specific dual memories."""
+        if isinstance(self.model, nn.DataParallel):
+            raise ValueError('itransformer_dual_retrieval currently supports one GPU only')
+        if self.args.dual_base_epochs < 1 or self.args.dual_base_patience < 1:
+            raise ValueError('dual_base_epochs and dual_base_patience must be positive')
+        gamma_grid = sorted(set(float(value) for value in self.args.dual_gamma_grid.split(',')))
+        if not gamma_grid or any(not np.isfinite(value) or value < 0 or value > 1
+                                 for value in gamma_grid):
+            raise ValueError('dual_gamma_grid must contain comma-separated values in [0,1]')
+
+        train_data, train_loader = self._get_data(flag='train')
+        vali_data, vali_loader = self._get_data(flag='val')
+        # The repository's generic validation loader shuffles and drops its
+        # final partial batch.  Gamma selection must use one fixed, complete
+        # validation set on every epoch.
+        vali_loader = DataLoader(
+            vali_data, batch_size=self.args.batch_size, shuffle=False,
+            num_workers=self.args.num_workers, drop_last=False,
+            pin_memory=bool(self.args.use_gpu))
+        path = os.path.join(self.args.checkpoints, setting)
+        os.makedirs(path, exist_ok=True)
+        base_checkpoint = os.path.join(path, 'base_checkpoint.pth')
+        history_path = os.path.join(path, 'dual_training_history.json')
+        feature_start = -1 if self.args.features == 'MS' else 0
+        core = self._dual_core()
+
+        # Stage A: train and select an ordinary iTransformer base.
+        print('Dual retrieval stage A: training standalone iTransformer backbone')
+        core.set_base_stage()
+        base_lr = self.args.dual_base_learning_rate or self.args.learning_rate
+        base_optimizer = optim.Adam(
+            (parameter for parameter in self.model.parameters() if parameter.requires_grad), lr=base_lr)
+        base_scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
+        base_best, base_stale, base_history = float('inf'), 0, []
+        for epoch in range(1, self.args.dual_base_epochs + 1):
+            self.model.train()
+            losses = []
+            started = time.time()
+            for batch in train_loader:
+                x, y, x_mark, y_mark, dec_inp, kwargs = self._dual_batch(batch)
+                target = y[:, -self.args.pred_len:, feature_start:]
+                base_optimizer.zero_grad()
+                with torch.cuda.amp.autocast(enabled=self.args.use_amp):
+                    outputs, _ = self._forecast_outputs(x, x_mark, dec_inp, y_mark, kwargs)
+                    loss = (outputs[:, -self.args.pred_len:, feature_start:] - target).square().mean()
+                base_scaler.scale(loss).backward()
+                base_scaler.step(base_optimizer)
+                base_scaler.update()
+                losses.append(loss.item())
+            validation = self._dual_base_validation(vali_loader)
+            row = dict(stage='base', epoch=epoch, train_loss=float(np.mean(losses)),
+                       validation_mse=validation, gamma=0., seconds=time.time() - started)
+            base_history.append(row)
+            print('Dual base epoch {} | train {:.7f} vali {:.7f} time {:.1f}s'.format(
+                epoch, row['train_loss'], validation, row['seconds']))
+            if validation < base_best:
+                base_best, base_stale = validation, 0
+                torch.save(self.model.state_dict(), base_checkpoint)
+            else:
+                base_stale += 1
+                if base_stale >= self.args.dual_base_patience:
+                    print('Dual base early stopping')
+                    break
+            for group in base_optimizer.param_groups:
+                group['lr'] = base_lr * 0.5 ** max(epoch - 1, 0)
+
+        self.model.load_state_dict(torch.load(base_checkpoint, map_location=self.device), strict=True)
+
+        # Stage B: freeze that checkpoint, construct exact hidden/residual keys,
+        # and train only the retrieval side.
+        print('Dual retrieval stage B: building frozen-backbone memory')
+        train_loader = initialize_dual_retrieval_memory(
+            self.model, train_data, train_loader,
+            use_time_marks=not ('PEMS' in self.args.data or 'Solar' in self.args.data))
+        print('Dual memory windows:', core.memory_starts.numel())
+        retrieval_lr = self.args.dual_retrieval_learning_rate or self.args.learning_rate
+        trainable = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        if not trainable:
+            raise RuntimeError('Dual retrieval stage has no trainable parameters')
+        optimizer = optim.Adam(trainable, lr=retrieval_lr)
+        scaler = torch.cuda.amp.GradScaler(enabled=self.args.use_amp)
+        best, stale, history = float('inf'), 0, list(base_history)
+        for epoch in range(1, self.args.train_epochs + 1):
+            core.set_gamma(1.)
+            self.model.train()
+            losses = []
+            started = time.time()
+            for batch in train_loader:
+                x, y, x_mark, y_mark, dec_inp, kwargs = self._dual_batch(batch)
+                target = y[:, -self.args.pred_len:, feature_start:]
+                optimizer.zero_grad()
+                with torch.cuda.amp.autocast(enabled=self.args.use_amp):
+                    outputs, _ = self._forecast_outputs(x, x_mark, dec_inp, y_mark, kwargs)
+                    loss = (outputs[:, -self.args.pred_len:, feature_start:] - target).square().mean()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                losses.append(loss.item())
+            gamma, validation = self._select_dual_gamma(vali_loader, gamma_grid)
+            # Produce branch/gate diagnostics at the selected validation gamma.
+            self.vali(vali_data, vali_loader, self._select_criterion())
+            row = dict(stage='retrieval', epoch=epoch, train_loss=float(np.mean(losses)),
+                       validation_mse=validation, gamma=gamma, seconds=time.time() - started)
+            history.append(row)
+            with open(history_path, 'w', encoding='utf-8') as stream:
+                json.dump(history, stream, indent=2, allow_nan=False)
+            print('Dual retrieval epoch {} | train {:.7f} vali {:.7f} gamma {:.2f} time {:.1f}s'.format(
+                epoch, row['train_loss'], validation, gamma, row['seconds']))
+            if validation < best:
+                best, stale = validation, 0
+                torch.save(self.model.state_dict(), os.path.join(path, 'checkpoint.pth'))
+            else:
+                stale += 1
+                if stale >= self.args.patience:
+                    print('Dual retrieval early stopping')
+                    break
+            for group in optimizer.param_groups:
+                group['lr'] = retrieval_lr * 0.5 ** max(epoch - 1, 0)
+
+        self.model.load_state_dict(
+            torch.load(os.path.join(path, 'checkpoint.pth'), map_location=self.device), strict=True)
+        print('Selected dual gamma:', float(core.dual_gamma.item()))
+        return self.model
+
     def train(self, setting):
+        if self.args.model == 'itransformer_dual_retrieval':
+            return self._train_dual_retrieval(setting)
         train_data, train_loader = self._get_data(flag='train')
         if self.args.model == 'itransformer_correlation':
             print('Initializing fixed correlation bases from training forecast labels...')
@@ -367,6 +558,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         if self.args.model == 'itransformer_retrieval':
             align_retrieval_prediction_data(self.model, pred_data)
+        elif self.args.model == 'itransformer_dual_retrieval':
+            align_dual_prediction_data(self.model, pred_data)
 
         preds = []
 

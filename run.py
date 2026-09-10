@@ -17,6 +17,7 @@ from model.itransformer_delay import delay_setting_suffix
 from model.itransformer_correlation import correlation_setting_suffix
 from model.itransformer_calibration import calibration_setting_suffix
 from model.itransformer_retrieval import retrieval_setting_suffix
+from model.itransformer_dual_retrieval import dual_retrieval_setting_suffix
 from model.iTransformer_pl import period_lag_setting_suffix
 
 if __name__ == '__main__':
@@ -27,7 +28,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='iTransformer',
-                        help='model name, options include: [iTransformer, itransformer_retrieval, itransformer_calibration, itransformer_correlation, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
+                        help='model name, options include: [iTransformer, itransformer_retrieval, itransformer_dual_retrieval, itransformer_calibration, itransformer_correlation, iTransformer_pl, itransformer_delay, iTransformer_refuture, iTransformer_multihead, iTransformer_fft, iTransformer_cross, iTransformer_decom, iTransformer_three]')
 
     # data loader
     parser.add_argument('--data', type=str, required=True, default='custom', help='dataset type')
@@ -127,6 +128,34 @@ if __name__ == '__main__':
                         help='Weight of backbone MSE; must be positive with gradient alignment or isolation')
     parser.add_argument('--retrieval_diagnostics', type=int, choices=[0, 1], default=1,
                         help='save branch MSE/MAE, batch reliability statistics and training curves')
+    # Frozen-backbone dual evidence retrieval: adapted future + retrieved residual.
+    parser.add_argument('--dual_base_epochs', type=int, default=10,
+                        help='maximum standalone iTransformer pretraining epochs')
+    parser.add_argument('--dual_base_patience', type=int, default=3)
+    parser.add_argument('--dual_base_learning_rate', type=float, default=0.0,
+                        help='0 reuses --learning_rate')
+    parser.add_argument('--dual_retrieval_learning_rate', type=float, default=0.0,
+                        help='0 reuses --learning_rate')
+    parser.add_argument('--dual_top_k', type=int, default=64)
+    parser.add_argument('--dual_temperature', type=float, default=0.1)
+    parser.add_argument('--dual_memory_size', type=int, default=4096,
+                        help='maximum memory windows; 0 keeps every admissible training window')
+    parser.add_argument('--dual_stride', type=int, default=1)
+    parser.add_argument('--dual_chunk_size', type=int, default=128)
+    parser.add_argument('--dual_variable_chunk_size', type=int, default=32)
+    parser.add_argument('--dual_memory_batch_size', type=int, default=128)
+    parser.add_argument('--dual_search_metric', choices=['l2', 'cosine'], default='l2')
+    parser.add_argument('--dual_global_weight', type=float, default=0.5,
+                        help='initial global-context share in post-selection neighbor weighting')
+    parser.add_argument('--dual_use_global', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_use_future', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_use_residual', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_causal_gap', type=int, default=-1,
+                        help='extra gap after a memory target; -1 uses pred_len')
+    parser.add_argument('--dual_horizon_gate', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_scale_residual', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_gamma_grid', type=str, default='0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1',
+                        help='validation-only global correction strengths; must include values in [0,1]')
     # Context-conditioned low-rank output calibration
     parser.add_argument('--calibration_rank', type=int, default=8)
     parser.add_argument('--calibration_hidden', type=int, default=32)
@@ -402,6 +431,8 @@ if __name__ == '__main__':
                 setting += calibration_setting_suffix(args)
             elif args.model == 'itransformer_retrieval':
                 setting += retrieval_setting_suffix(args)
+            elif args.model == 'itransformer_dual_retrieval':
+                setting += dual_retrieval_setting_suffix(args)
             elif args.model == 'iTransformer_multihead':
                 relation_heads = args.mh_relation_heads or args.n_heads
                 setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(
@@ -496,6 +527,8 @@ if __name__ == '__main__':
             setting += calibration_setting_suffix(args)
         elif args.model == 'itransformer_retrieval':
             setting += retrieval_setting_suffix(args)
+        elif args.model == 'itransformer_dual_retrieval':
+            setting += dual_retrieval_setting_suffix(args)
         elif args.model == 'iTransformer_multihead':
             relation_heads = args.mh_relation_heads or args.n_heads
             setting += '_hcrh{}_hd{}_gd{}_ht{}_hp{}_ri{}_xs{}_reg{}-{}'.format(

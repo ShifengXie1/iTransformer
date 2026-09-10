@@ -35,7 +35,9 @@ class RetrievalDiagnostics:
             self.counts[name] = self.counts.get(name, 0) + count
             row[name] = total / count if count else None
 
-        for name, key in [('base', 'base'), ('retrieval', 'retrieval'), ('fused', 'prediction')]:
+        forecasts = [('base', 'base'), ('retrieval', 'retrieval'), ('fused', 'prediction')]
+        forecasts += [(name, name) for name in ('future', 'residual') if name in components]
+        for name, key in forecasts:
             prediction = components[key][:, -target.size(1):, start:].detach().double().cpu()
             error = prediction - target
             if self.error_scale is not None:
@@ -64,10 +66,16 @@ class RetrievalDiagnostics:
             record('global_similarity', components['global_similarity'][:, start:].detach().cpu()[available])
         record('mean_similarity', components['similarity'][:, start:].detach().cpu()[available])
         record('mean_gate', components['gate'][:, :, start:])
+        for name in ('base_gate', 'future_gate', 'residual_gate'):
+            if name in components:
+                record('mean_' + name, components[name][:, :, start:])
         for segment, values in enumerate(torch.tensor_split(components['gate'][:, :, start:], 4, dim=1), 1):
             record('mean_gate_q' + str(segment), values)
         record('future_variance', components['future_variance'][:, :, start:].detach().cpu()[
             available[:, None, :].expand(-1, components['future_variance'].size(1), -1)])
+        if 'residual_variance' in components:
+            record('residual_variance', components['residual_variance'][:, :, start:].detach().cpu()[
+                available[:, None, :].expand(-1, components['residual_variance'].size(1), -1)])
         ratios = components['scale_ratio_mean'][:, start:].detach().double().cpu()[available]
         record('scale_ratio_mean', ratios)
         record('scale_ratio_max_mean', components['scale_ratio_max'][:, start:].detach().cpu()[available])
@@ -92,8 +100,10 @@ class RetrievalDiagnostics:
 def print_retrieval_summary(label, summary):
     if not summary or 'base_mse' not in summary:
         return
+    names = ['base', 'retrieval', 'fused']
+    names += [name for name in ('future', 'residual') if name + '_mse' in summary]
     values = ['{} MSE={:.6f} MAE={:.6f}'.format(name, summary[name + '_mse'], summary[name + '_mae'])
-              for name in ('base', 'retrieval', 'fused')]
+              for name in names]
     print('Retrieval {}: {}'.format(label, ' | '.join(values)))
     if 'fused_mse_q1' in summary:
         def quarters(prefix):

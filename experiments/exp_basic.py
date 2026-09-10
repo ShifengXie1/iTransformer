@@ -5,7 +5,7 @@ from model import Transformer, Informer, Reformer, Flowformer, Flashformer, \
     iTransformer_fft, iTransformer_cross, iTransformer_decom, \
     iTransformer_three, iTransformer_refuture, \
     iTransformer_multihead, itransformer_delay, itransformer_correlation, iTransformer_pl, \
-    itransformer_calibration, itransformer_retrieval
+    itransformer_calibration, itransformer_retrieval, itransformer_dual_retrieval
 
 
 class Exp_Basic(object):
@@ -23,6 +23,7 @@ class Exp_Basic(object):
             'itransformer_correlation': itransformer_correlation,
             'itransformer_calibration': itransformer_calibration,
             'itransformer_retrieval': itransformer_retrieval,
+            'itransformer_dual_retrieval': itransformer_dual_retrieval,
             'iTransformer_fft': iTransformer_fft,
             'iTransformer_cross': iTransformer_cross,
             'iTransformer_decom': iTransformer_decom,

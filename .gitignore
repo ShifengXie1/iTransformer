@@ -145,3 +145,4 @@ tests/
 .*/
 checks/
 docs/
+tmp/
