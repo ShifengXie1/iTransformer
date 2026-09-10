@@ -294,8 +294,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 target = y[:, -self.args.pred_len:, feature_start:]
                 optimizer.zero_grad()
                 with torch.cuda.amp.autocast(enabled=self.args.use_amp):
-                    outputs, _ = self._forecast_outputs(x, x_mark, dec_inp, y_mark, kwargs)
-                    loss = (outputs[:, -self.args.pred_len:, feature_start:] - target).square().mean()
+                    outputs, components = self._forecast_outputs(
+                        x, x_mark, dec_inp, y_mark, kwargs)
+                    prediction = outputs[:, -self.args.pred_len:, feature_start:]
+                    loss = (prediction - target).square().mean()
+                    loss = self._add_model_auxiliary_loss(
+                        loss, target, prediction, components)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()

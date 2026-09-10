@@ -1,16 +1,16 @@
-"""Transferability-aware dual retrieval for multivariate forecasting.
+"""Transferability-aware residual retrieval for multivariate forecasting.
 
 The model deliberately differs from residual-only post-processing.  A frozen
 iTransformer supplies the base forecast and stable final-encoder retrieval
-keys.  One variable-wise, causally filtered neighbor set produces two forms of
-evidence:
+keys.  A union of variable-local and global-regime neighbors produces residual
+evidence.  Direct future retrieval remains available only as an ablation:
 
 * a query-adapted historical continuation (future expert), and
 * a scale-transported historical base-model error (residual expert).
 
-Local variable keys determine which cases are retained.  Pooled multivariate
-context can only reweight those cases, so a global state cannot discard a
-variable-specific neighbor.  A three-way gate selects base/future/residual for
+Local variable keys and pooled multivariate context each contribute candidates;
+their union prevents either view from hiding useful evidence from the other.  A
+conservative gate shrinks the retrieved residual toward the frozen base for
 every sample, variable and horizon.  Nonnegative uncertainty and disagreement
 penalties make an expert's logit monotonically decrease as its evidence becomes
 less reliable.  An optional smooth horizon basis changes confidence without
@@ -48,25 +48,28 @@ class DualRetrievedEvidence(NamedTuple):
 class Model(OriginalITransformer):
     def __init__(self, configs):
         super().__init__(configs)
-        self.dual_top_k = int(getattr(configs, 'dual_top_k', 64))
+        self.dual_top_k = int(getattr(configs, 'dual_top_k', 32))
+        self.dual_global_top_k = int(getattr(configs, 'dual_global_top_k', 32))
         self.dual_temperature = float(getattr(configs, 'dual_temperature', 0.1))
-        self.dual_memory_size = int(getattr(configs, 'dual_memory_size', 4096))
+        self.dual_memory_size = int(getattr(configs, 'dual_memory_size', 0))
         self.dual_stride = int(getattr(configs, 'dual_stride', 1))
         self.dual_chunk_size = int(getattr(configs, 'dual_chunk_size', 128))
         self.dual_variable_chunk_size = int(getattr(configs, 'dual_variable_chunk_size', 32))
         self.dual_memory_batch_size = int(getattr(configs, 'dual_memory_batch_size', 128))
         self.dual_search_metric = str(getattr(configs, 'dual_search_metric', 'l2')).lower()
-        self.dual_use_future = bool(getattr(configs, 'dual_use_future', True))
+        self.dual_use_future = bool(getattr(configs, 'dual_use_future', False))
         self.dual_use_residual = bool(getattr(configs, 'dual_use_residual', True))
         self.dual_use_global = bool(getattr(configs, 'dual_use_global', True))
         self.dual_horizon_gate = bool(getattr(configs, 'dual_horizon_gate', True))
         self.dual_scale_residual = bool(getattr(configs, 'dual_scale_residual', True))
-        causal_gap = int(getattr(configs, 'dual_causal_gap', -1))
-        self.dual_causal_gap = self.pred_len if causal_gap < 0 else causal_gap
+        self.dual_train_metric = bool(getattr(configs, 'dual_train_metric', False))
+        self.dual_utility_loss_weight = float(getattr(configs, 'dual_utility_loss_weight', 0.1))
+        self.dual_causal_gap = int(getattr(configs, 'dual_causal_gap', 0))
 
         positive = (self.dual_top_k, self.dual_stride, self.dual_chunk_size,
                     self.dual_variable_chunk_size, self.dual_memory_batch_size)
-        if min(positive) < 1 or self.dual_memory_size < 0 or self.dual_causal_gap < 0:
+        if (min(positive) < 1 or self.dual_global_top_k < 0 or
+                self.dual_memory_size < 0 or self.dual_causal_gap < 0):
             raise ValueError('Dual retrieval sizes must be positive; memory_size and causal_gap may be zero')
         if not math.isfinite(self.dual_temperature) or self.dual_temperature <= 0:
             raise ValueError('dual_temperature must be finite and positive')
@@ -74,6 +77,9 @@ class Model(OriginalITransformer):
             raise ValueError("dual_search_metric must be 'l2' or 'cosine'")
         if not (self.dual_use_future or self.dual_use_residual):
             raise ValueError('At least one dual retrieval expert must be enabled')
+        if (not math.isfinite(self.dual_utility_loss_weight) or
+                self.dual_utility_loss_weight < 0):
+            raise ValueError('dual_utility_loss_weight must be finite and nonnegative')
 
         d_model = configs.d_model
         self.local_projection = nn.Linear(d_model, d_model, bias=False)
@@ -160,6 +166,19 @@ class Model(OriginalITransformer):
         for name, parameter in self.named_parameters():
             if not name.startswith(('enc_embedding.', 'encoder.', 'projector.')):
                 parameter.requires_grad_(True)
+        # The frozen encoder already defines a useful metric.  Learning two
+        # unrestricted D x D transforms from a small retrieval-calibration set
+        # is optional because it can easily overfit benchmark datasets.
+        for parameter in self.local_projection.parameters():
+            parameter.requires_grad_(self.dual_train_metric)
+        for parameter in self.global_projection.parameters():
+            parameter.requires_grad_(self.dual_train_metric and self.dual_use_global)
+        self.global_weight_logit.requires_grad_(self.dual_use_global)
+        for parameter in self.continuation_adapter.parameters():
+            parameter.requires_grad_(self.dual_use_future)
+        self.residual_gain_logit.requires_grad_(self.dual_use_residual)
+        self.residual_scale_power_logit.requires_grad_(
+            self.dual_use_residual and self.dual_scale_residual)
 
     def train(self, mode=True):
         super().train(mode)
@@ -253,19 +272,23 @@ class Model(OriginalITransformer):
             marks = (None if memory_x_mark is None else
                      memory_x_mark[first:last].to(device=device, dtype=dtype))
             base, key, normalized, means, stdev, _ = self._encode_backbone(x, marks)
-            future = ((y - means) / stdev).permute(0, 2, 1)
-            residual = (y - base).permute(0, 2, 1)
+            if self.dual_use_future:
+                future = ((y - means) / stdev).permute(0, 2, 1)
+                pasts.append(normalized.detach())
+                futures.append(future.detach())
+            if self.dual_use_residual:
+                residuals.append((y - base).permute(0, 2, 1).detach())
             keys.append(key.detach())
-            pasts.append(normalized.detach())
-            futures.append(future.detach())
-            residuals.append(residual.detach())
             past_stds.append(stdev.squeeze(1).detach())
 
         self.memory_keys = torch.cat(keys, 0)
         self.memory_global_keys = self.memory_keys.mean(1)
-        self.memory_past = torch.cat(pasts, 0)
-        self.memory_future = torch.cat(futures, 0)
-        self.memory_residual = torch.cat(residuals, 0)
+        self.memory_past = (torch.cat(pasts, 0) if pasts else
+                            torch.empty(0, device=device, dtype=dtype))
+        self.memory_future = (torch.cat(futures, 0) if futures else
+                              torch.empty(0, device=device, dtype=dtype))
+        self.memory_residual = (torch.cat(residuals, 0) if residuals else
+                                torch.empty(0, device=device, dtype=dtype))
         self.memory_past_std = torch.cat(past_stds, 0)
         self.memory_starts = starts.to(device=device)
         self.memory_ready.fill_(True)
@@ -310,6 +333,41 @@ class Model(OriginalITransformer):
             best_indices = indices.gather(-1, positions)
         return best_indices, torch.isfinite(best_scores)
 
+    @torch.no_grad()
+    def _select_global_neighbors(self, query_key, query_end):
+        """Retrieve pooled-regime neighbors without replacing local matches."""
+        count = self.memory_starts.numel()
+        k = min(self.dual_global_top_k, count)
+        if k == 0:
+            empty_indices = torch.empty(
+                query_key.size(0), 0, dtype=torch.long, device=query_key.device)
+            return empty_indices, empty_indices.bool()
+        best_scores = query_key.new_empty(query_key.size(0), 0, dtype=torch.float32)
+        best_indices = torch.empty(
+            query_key.size(0), 0, dtype=torch.long, device=query_key.device)
+        for start in range(0, count, self.dual_chunk_size):
+            stop = min(start + self.dual_chunk_size, count)
+            keys = self.memory_global_keys[start:stop]
+            if self.dual_search_metric == 'cosine':
+                scores = torch.einsum(
+                    'bd,md->bm', F.normalize(query_key.float(), dim=-1),
+                    F.normalize(keys.float(), dim=-1))
+            else:
+                scores = -(query_key.float().unsqueeze(1) -
+                           keys.float().unsqueeze(0)).square().mean(-1)
+            if query_end is not None:
+                availability = (self.memory_starts[start:stop] + self.seq_len +
+                                self.pred_len + self.dual_causal_gap)
+                scores = scores.masked_fill(
+                    availability[None, :] > query_end[:, None], -torch.inf)
+            indices = torch.arange(start, stop, device=query_key.device).expand(
+                query_key.size(0), -1)
+            scores = torch.cat((best_scores, scores), dim=-1)
+            indices = torch.cat((best_indices, indices), dim=-1)
+            best_scores, positions = scores.topk(min(k, scores.size(-1)), dim=-1)
+            best_indices = indices.gather(-1, positions)
+        return best_indices, torch.isfinite(best_scores)
+
     def retrieve(self, query_keys, query_past, query_means, query_stds, query_end=None):
         if not self.retrieval_ready:
             raise RuntimeError('Dual retrieval memory is not ready')
@@ -324,6 +382,11 @@ class Model(OriginalITransformer):
         similarities, statistics, future_variances, residual_variances = [], [], [], []
         counts = []
         global_query = query_keys.mean(1)
+        if self.dual_use_global and self.dual_global_top_k:
+            global_indices, global_valid = self._select_global_neighbors(
+                global_query, query_end)
+        else:
+            global_indices = global_valid = None
         mix = (torch.sigmoid(self.global_weight_logit.float()) if self.dual_use_global
                else query_keys.new_zeros((), dtype=torch.float32))
         query_mean = query_means.squeeze(1)
@@ -333,7 +396,20 @@ class Model(OriginalITransformer):
             for first in range(0, query_keys.size(1), self.dual_variable_chunk_size):
                 last = min(first + self.dual_variable_chunk_size, query_keys.size(1))
                 query = query_keys[:, first:last].float()
-                indices, valid = self._select_neighbors(query, query_end, first)
+                local_indices, local_valid = self._select_neighbors(
+                    query, query_end, first)
+                indices, valid = local_indices, local_valid
+                if global_indices is not None:
+                    regime_indices = global_indices[:, None, :].expand(
+                        -1, last - first, -1)
+                    regime_valid = global_valid[:, None, :].expand_as(regime_indices)
+                    # Do not count an item twice when both retrieval views find it.
+                    duplicate = ((regime_indices.unsqueeze(-1) ==
+                                  local_indices.unsqueeze(-2)) &
+                                 local_valid.unsqueeze(-2)).any(-1)
+                    regime_valid = regime_valid & ~duplicate
+                    indices = torch.cat((local_indices, regime_indices), -1)
+                    valid = torch.cat((local_valid, regime_valid), -1)
                 safe_indices = indices.clamp_min(0)
                 channels = torch.arange(first, last, device=query.device)[None, :, None]
 
@@ -350,28 +426,38 @@ class Model(OriginalITransformer):
                 logits = torch.where(valid.any(-1, keepdim=True), logits, torch.zeros_like(logits))
                 weights = logits.softmax(-1) * valid
 
-                memory_past = self.memory_past[safe_indices, channels]
-                future_candidates = self.memory_future[safe_indices, channels]
-                adapted = future_candidates + self.continuation_adapter(
-                    query_past[:, first:last].float().unsqueeze(2) - memory_past.float())
-                future_candidates = (adapted * query_std[:, first:last, None, None].float() +
-                                     query_mean[:, first:last, None, None].float())
+                shape = (query.size(0), last - first, self.pred_len)
+                if self.dual_use_future:
+                    memory_past = self.memory_past[safe_indices, channels]
+                    future_candidates = self.memory_future[safe_indices, channels]
+                    adapted = future_candidates + self.continuation_adapter(
+                        query_past[:, first:last].float().unsqueeze(2) - memory_past.float())
+                    future_candidates = (
+                        adapted * query_std[:, first:last, None, None].float() +
+                        query_mean[:, first:last, None, None].float())
+                    future = (weights.unsqueeze(-1) * future_candidates).sum(2)
+                    future_variance = (weights.unsqueeze(-1) *
+                                       (future_candidates - future.unsqueeze(2)).square()).sum(2)
+                else:
+                    future = query.new_zeros(shape, dtype=torch.float32)
+                    future_variance = query.new_zeros(shape, dtype=torch.float32)
 
-                residual_candidates = self.memory_residual[safe_indices, channels].float()
-                if self.dual_scale_residual:
-                    ratio = (query_std[:, first:last, None].float() /
-                             self.memory_past_std[safe_indices, channels].float().clamp_min(1e-5))
-                    power = torch.sigmoid(self.residual_scale_power_logit.float())
-                    residual_candidates = residual_candidates * ratio.clamp(0.25, 4).pow(power).unsqueeze(-1)
-                gain = 2 * torch.sigmoid(self.residual_gain_logit.float())
-                residual_candidates = gain * residual_candidates
-
-                future = (weights.unsqueeze(-1) * future_candidates).sum(2)
-                residual = (weights.unsqueeze(-1) * residual_candidates).sum(2)
-                future_variance = (weights.unsqueeze(-1) *
-                                   (future_candidates - future.unsqueeze(2)).square()).sum(2)
-                residual_variance = (weights.unsqueeze(-1) *
-                                     (residual_candidates - residual.unsqueeze(2)).square()).sum(2)
+                if self.dual_use_residual:
+                    residual_candidates = self.memory_residual[safe_indices, channels].float()
+                    if self.dual_scale_residual:
+                        ratio = (query_std[:, first:last, None].float() /
+                                 self.memory_past_std[safe_indices, channels].float().clamp_min(1e-5))
+                        power = torch.sigmoid(self.residual_scale_power_logit.float())
+                        residual_candidates = (residual_candidates *
+                                               ratio.clamp(0.25, 4).pow(power).unsqueeze(-1))
+                    gain = 2 * torch.sigmoid(self.residual_gain_logit.float())
+                    residual_candidates = gain * residual_candidates
+                    residual = (weights.unsqueeze(-1) * residual_candidates).sum(2)
+                    residual_variance = (weights.unsqueeze(-1) *
+                                         (residual_candidates - residual.unsqueeze(2)).square()).sum(2)
+                else:
+                    residual = query.new_zeros(shape, dtype=torch.float32)
+                    residual_variance = query.new_zeros(shape, dtype=torch.float32)
 
                 valid_count = valid.sum(-1, keepdim=True).clamp_min(1)
                 has_history = valid.any(-1, keepdim=True)
@@ -383,15 +469,7 @@ class Model(OriginalITransformer):
                 minimum = torch.where(has_history,
                                       scores.masked_fill(~valid, torch.inf).amin(-1, keepdim=True), 0.)
 
-                if query_end is None:
-                    candidate_count = torch.full(
-                        (query.size(0), last - first), self.memory_starts.numel(),
-                        device=query.device, dtype=torch.long)
-                else:
-                    availability = (self.memory_starts + self.seq_len + self.pred_len +
-                                    self.dual_causal_gap)
-                    per_batch = torch.searchsorted(availability, query_end, right=True)
-                    candidate_count = per_batch[:, None].expand(-1, last - first)
+                candidate_count = valid.sum(-1)
 
                 futures.append(future)
                 residuals.append(residual)
@@ -458,14 +536,20 @@ class Model(OriginalITransformer):
     def _base_components(self, base):
         batch, horizon, variables = base.shape
         zeros = base.new_zeros(batch, horizon, variables)
-        return dict(prediction=base, base=base, retrieval=base, future=base, residual=base,
-                    gate=zeros, base_gate=torch.ones_like(base), future_gate=zeros,
-                    residual_gate=zeros, available=zeros[:, 0].bool(),
-                    candidate_count=zeros[:, 0], similarity=zeros[:, 0],
-                    scale_ratio_mean=torch.ones_like(zeros[:, 0]),
-                    scale_ratio_max=torch.ones_like(zeros[:, 0]),
-                    future_variance=zeros, residual_variance=zeros,
-                    gamma=self.dual_gamma.detach().clone())
+        components = dict(
+            prediction=base, base=base, retrieval=base,
+            gate=zeros, base_gate=torch.ones_like(base), future_gate=zeros,
+            residual_gate=zeros, available=zeros[:, 0].bool(),
+            candidate_count=zeros[:, 0], similarity=zeros[:, 0],
+            scale_ratio_mean=torch.ones_like(zeros[:, 0]),
+            scale_ratio_max=torch.ones_like(zeros[:, 0]),
+            future_variance=zeros, residual_variance=zeros,
+            gamma=self.dual_gamma.detach().clone())
+        if self.dual_use_future:
+            components['future'] = base
+        if self.dual_use_residual:
+            components['residual'] = base
+        return components
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec,
                  query_end=None, return_components=False):
@@ -488,16 +572,19 @@ class Model(OriginalITransformer):
             ratio_max = ratios.masked_fill(~valid, 0.).amax(-1)
             components = dict(
                 prediction=prediction, base=base.detach(), retrieval=mixture,
-                future=future, residual=residual,
                 gate=(future_gate + residual_gate).detach(),
-                base_gate=base_gate.detach(), future_gate=future_gate.detach(),
-                residual_gate=residual_gate.detach(), available=available,
+                base_gate=base_gate.detach(), future_gate=future_gate,
+                residual_gate=residual_gate, available=available,
                 candidate_count=evidence.candidate_count,
                 similarity=evidence.similarity.detach().squeeze(-1),
                 scale_ratio_mean=ratio_mean.detach(), scale_ratio_max=ratio_max.detach(),
                 future_variance=evidence.future_variance.detach().permute(0, 2, 1),
                 residual_variance=evidence.residual_variance.detach().permute(0, 2, 1),
                 gamma=self.dual_gamma.detach().clone())
+            if self.dual_use_future:
+                components['future'] = future
+            if self.dual_use_residual:
+                components['residual'] = residual
             return prediction, attention, components
         return prediction, attention
 
@@ -513,8 +600,32 @@ class Model(OriginalITransformer):
         return (prediction, attention) if self.output_attention else prediction
 
     def base_auxiliary_loss(self, components, target):
-        # The backbone is trained in its own stage and frozen during retrieval.
-        return target.new_zeros(())
+        """Teach the residual gate the oracle shrinkage on causal train pairs.
+
+        The fused MSE remains the main objective.  This small auxiliary target
+        prevents a flexible gate from learning a large correction merely from
+        noisy end-to-end gradients.  It is intentionally disabled when the
+        future expert is enabled because then a single-expert oracle is not the
+        correct target.
+        """
+        if (self.dual_utility_loss_weight <= 0 or not self.dual_use_residual or
+                self.dual_use_future or components is None):
+            return target.new_zeros(())
+        horizon = target.size(1)
+        variables = target.size(2)
+        base = components['base'][:, -horizon:, -variables:].detach()
+        corrected = components['residual'][:, -horizon:, -variables:].detach()
+        delta = corrected - base
+        error = target.detach() - base
+        oracle = (error * delta / delta.square().clamp_min(1e-5)).clamp(0, 1)
+        gate = components['residual_gate'][:, -horizon:, -variables:]
+        available = components['available'][:, -variables:].unsqueeze(1).expand_as(gate)
+        informative = delta.abs() > 1e-4
+        mask = available & informative
+        if not mask.any():
+            return target.new_zeros(())
+        return self.dual_utility_loss_weight * F.smooth_l1_loss(
+            gate[mask], oracle[mask], beta=0.1)
 
 
 class _IndexedTrainingDataset(Dataset):
@@ -587,16 +698,19 @@ def align_dual_prediction_data(model, dataset):
 
 
 def dual_retrieval_setting_suffix(configs):
-    gap = getattr(configs, 'dual_causal_gap', -1)
-    return '_dualret_k{}_t{}_m{}_s{}_metric{}_gw{}_ug{}_f{}_r{}_gap{}_hg{}_sr{}'.format(
-        getattr(configs, 'dual_top_k', 64),
+    gap = getattr(configs, 'dual_causal_gap', 0)
+    return '_dualret_k{}_gk{}_t{}_m{}_s{}_metric{}_tm{}_gw{}_ug{}_f{}_r{}_gap{}_hg{}_sr{}_ul{}'.format(
+        getattr(configs, 'dual_top_k', 32),
+        getattr(configs, 'dual_global_top_k', 32),
         getattr(configs, 'dual_temperature', 0.1),
-        getattr(configs, 'dual_memory_size', 4096),
+        getattr(configs, 'dual_memory_size', 0),
         getattr(configs, 'dual_stride', 1),
         getattr(configs, 'dual_search_metric', 'l2'),
+        getattr(configs, 'dual_train_metric', 0),
         getattr(configs, 'dual_global_weight', 0.5),
         getattr(configs, 'dual_use_global', 1),
-        getattr(configs, 'dual_use_future', 1),
+        getattr(configs, 'dual_use_future', 0),
         getattr(configs, 'dual_use_residual', 1), gap,
         getattr(configs, 'dual_horizon_gate', 1),
-        getattr(configs, 'dual_scale_residual', 1))
+        getattr(configs, 'dual_scale_residual', 1),
+        getattr(configs, 'dual_utility_loss_weight', 0.1))

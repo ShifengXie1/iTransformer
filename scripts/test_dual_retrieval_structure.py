@@ -27,11 +27,13 @@ def config(**overrides):
         e_layers=1, dropout=0.1, embed='timeF', freq='h', factor=1,
         activation='gelu', class_strategy='projection', output_attention=False,
         use_norm=True, dual_top_k=3, dual_temperature=0.2,
+        dual_global_top_k=2,
         dual_memory_size=32, dual_stride=1, dual_chunk_size=5,
         dual_variable_chunk_size=1, dual_memory_batch_size=4,
         dual_search_metric='l2', dual_global_weight=0.5,
         dual_use_global=True, dual_use_future=True, dual_use_residual=True,
-        dual_causal_gap=0, dual_horizon_gate=True, dual_scale_residual=True)
+        dual_causal_gap=0, dual_horizon_gate=True, dual_scale_residual=True,
+        dual_train_metric=True, dual_utility_loss_weight=0.1)
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -98,15 +100,17 @@ class DualRetrievalChecks(unittest.TestCase):
         self.assertTrue(torch.all(high_future_gate < low_future_gate))
 
     def test_strict_state_roundtrip_preserves_memory_and_prediction(self):
-        model = self.build_model().eval()
-        x = torch.randn(2, model.seq_len, 2)
-        ends = torch.tensor([100, 100])
-        expected = model(x, None, None, None, query_end=ends)
-        restored = Model(config()).eval()
-        restored.load_state_dict(model.state_dict(), strict=True)
-        actual = restored(x, None, None, None, query_end=ends)
-        self.assertTrue(restored.retrieval_ready)
-        self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
+        for use_future in (True, False):
+            with self.subTest(use_future=use_future):
+                model = self.build_model(dual_use_future=use_future).eval()
+                x = torch.randn(2, model.seq_len, 2)
+                ends = torch.tensor([100, 100])
+                expected = model(x, None, None, None, query_end=ends)
+                restored = Model(config(dual_use_future=use_future)).eval()
+                restored.load_state_dict(model.state_dict(), strict=True)
+                actual = restored(x, None, None, None, query_end=ends)
+                self.assertTrue(restored.retrieval_ready)
+                self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
 
     def test_single_expert_ablation_masks_the_other_expert(self):
         model = Model(config(dual_use_future=False, dual_use_residual=True))
@@ -115,8 +119,39 @@ class DualRetrievalChecks(unittest.TestCase):
                            starts=torch.arange(12))
         parts = model(torch.randn(1, 8, 2), None, None, None,
                       query_end=torch.tensor([100]), return_components=True)
+        self.assertEqual(model.memory_past.numel(), 0)
+        self.assertEqual(model.memory_future.numel(), 0)
+        self.assertNotIn('future', parts)
         self.assertTrue(torch.equal(parts['future_gate'], torch.zeros_like(parts['future_gate'])))
         self.assertTrue((parts['residual_gate'] > 0).all())
+
+    def test_residual_utility_loss_trains_gate(self):
+        model = self.build_model(dual_use_future=False).train()
+        x = torch.randn(2, model.seq_len, 2)
+        target = torch.randn(2, model.pred_len, 2)
+        parts = model(x, None, None, None, query_end=torch.tensor([100, 100]),
+                      return_components=True)
+        utility = model.base_auxiliary_loss(parts, target)
+        self.assertGreater(utility.item(), 0)
+        utility.backward()
+        self.assertIsNotNone(model.expert_gate[-1].weight.grad)
+        self.assertGreater(model.expert_gate[-1].weight.grad.abs().sum().item(), 0)
+
+    def test_local_and_global_neighbors_form_a_unique_union(self):
+        model = self.build_model(
+            dual_use_future=False, dual_top_k=1, dual_global_top_k=1).eval()
+        with torch.no_grad():
+            model.memory_keys.fill_(10)
+            model.memory_keys[0].zero_()
+            model.memory_global_keys.fill_(10)
+            model.memory_global_keys[1].zero_()
+        evidence = model.retrieve(
+            torch.zeros(1, 2, 16), torch.zeros(1, 2, 8),
+            torch.zeros(1, 1, 2), torch.ones(1, 1, 2),
+            query_end=torch.tensor([100]))
+        self.assertTrue(torch.equal(
+            evidence.candidate_count, torch.full((1, 2), 2)))
+        self.assertTrue((evidence.indices[..., 0] != evidence.indices[..., 1]).all())
 
     def test_dataset_initializer_preserves_training_positions(self):
         class ToyDataset(Dataset):

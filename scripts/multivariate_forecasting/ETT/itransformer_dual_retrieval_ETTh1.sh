@@ -7,12 +7,24 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-10}"
 # Resolve the repository root from scripts/multivariate_forecasting/ETT.
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
-# Two-stage experiment:
+# Two-stage conservative residual-retrieval experiment:
 #   A. train/select a standalone iTransformer;
-#   B. freeze it, build key+future+residual memory, and train only retrieval.
-# The default causal gap is one prediction horizon.  Validation selects gamma
-# from DUAL_GAMMA_GRID, including gamma=0 as a complete base fallback.
-PYTHON="${PYTHON:-python}"
+#   B. freeze it, build local/global keys plus residual memory, and train only
+#      the residual transport and reliability gate.
+# A candidate is already causal when its target ends before the query origin,
+# so the default extra causal gap is zero. Validation selects gamma from
+# DUAL_GAMMA_GRID, including gamma=0 as a complete base fallback.
+# Direct-future retrieval and full metric learning remain optional ablations.
+# Prefer the repository environment so this script can be launched directly.
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x ".venv-retrieval/Scripts/python.exe" ]]; then
+    PYTHON=".venv-retrieval/Scripts/python.exe"
+  elif [[ -x ".venv-retrieval/bin/python" ]]; then
+    PYTHON=".venv-retrieval/bin/python"
+  else
+    PYTHON="python"
+  fi
+fi
 read -r -a horizons <<< "${PRED_LENS:-96 192 336 720}"
 read -r -a seeds <<< "${SEEDS:-2023}"
 
@@ -49,9 +61,10 @@ for seed in "${seeds[@]}"; do
       --learning_rate "${LEARNING_RATE:-0.0001}" \
       --dual_base_learning_rate "${DUAL_BASE_LR:-0}" \
       --dual_retrieval_learning_rate "${DUAL_RETRIEVAL_LR:-0}" \
-      --dual_top_k "${DUAL_TOP_K:-64}" \
+      --dual_top_k "${DUAL_TOP_K:-32}" \
+      --dual_global_top_k "${DUAL_GLOBAL_TOP_K:-32}" \
       --dual_temperature "${DUAL_TEMPERATURE:-0.1}" \
-      --dual_memory_size "${DUAL_MEMORY_SIZE:-4096}" \
+      --dual_memory_size "${DUAL_MEMORY_SIZE:-0}" \
       --dual_stride "${DUAL_STRIDE:-1}" \
       --dual_chunk_size "${DUAL_CHUNK_SIZE:-128}" \
       --dual_variable_chunk_size "${DUAL_VARIABLE_CHUNK_SIZE:-32}" \
@@ -59,11 +72,13 @@ for seed in "${seeds[@]}"; do
       --dual_search_metric "${DUAL_SEARCH_METRIC:-l2}" \
       --dual_global_weight "${DUAL_GLOBAL_WEIGHT:-0.5}" \
       --dual_use_global "${DUAL_USE_GLOBAL:-1}" \
-      --dual_use_future "${DUAL_USE_FUTURE:-1}" \
+      --dual_use_future "${DUAL_USE_FUTURE:-0}" \
       --dual_use_residual "${DUAL_USE_RESIDUAL:-1}" \
-      --dual_causal_gap "${DUAL_CAUSAL_GAP:--1}" \
+      --dual_causal_gap "${DUAL_CAUSAL_GAP:-0}" \
       --dual_horizon_gate "${DUAL_HORIZON_GATE:-1}" \
       --dual_scale_residual "${DUAL_SCALE_RESIDUAL:-1}" \
+      --dual_train_metric "${DUAL_TRAIN_METRIC:-0}" \
+      --dual_utility_loss_weight "${DUAL_UTILITY_LOSS_WEIGHT:-0.1}" \
       --dual_gamma_grid "${DUAL_GAMMA_GRID:-0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1}" \
       --retrieval_diagnostics "${RETRIEVAL_DIAGNOSTICS:-1}" \
       --des "${DESCRIPTION:-DualRetrieval}"

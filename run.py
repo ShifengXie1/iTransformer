@@ -128,7 +128,7 @@ if __name__ == '__main__':
                         help='Weight of backbone MSE; must be positive with gradient alignment or isolation')
     parser.add_argument('--retrieval_diagnostics', type=int, choices=[0, 1], default=1,
                         help='save branch MSE/MAE, batch reliability statistics and training curves')
-    # Frozen-backbone dual evidence retrieval: adapted future + retrieved residual.
+    # Frozen-backbone retrieval: residual correction by default; future is an ablation.
     parser.add_argument('--dual_base_epochs', type=int, default=10,
                         help='maximum standalone iTransformer pretraining epochs')
     parser.add_argument('--dual_base_patience', type=int, default=3)
@@ -136,9 +136,12 @@ if __name__ == '__main__':
                         help='0 reuses --learning_rate')
     parser.add_argument('--dual_retrieval_learning_rate', type=float, default=0.0,
                         help='0 reuses --learning_rate')
-    parser.add_argument('--dual_top_k', type=int, default=64)
+    parser.add_argument('--dual_top_k', type=int, default=32,
+                        help='per-variable local neighbors retained in the candidate union')
+    parser.add_argument('--dual_global_top_k', type=int, default=32,
+                        help='pooled-regime neighbors added to each variable; 0 disables the union branch')
     parser.add_argument('--dual_temperature', type=float, default=0.1)
-    parser.add_argument('--dual_memory_size', type=int, default=4096,
+    parser.add_argument('--dual_memory_size', type=int, default=0,
                         help='maximum memory windows; 0 keeps every admissible training window')
     parser.add_argument('--dual_stride', type=int, default=1)
     parser.add_argument('--dual_chunk_size', type=int, default=128)
@@ -146,14 +149,19 @@ if __name__ == '__main__':
     parser.add_argument('--dual_memory_batch_size', type=int, default=128)
     parser.add_argument('--dual_search_metric', choices=['l2', 'cosine'], default='l2')
     parser.add_argument('--dual_global_weight', type=float, default=0.5,
-                        help='initial global-context share in post-selection neighbor weighting')
+                        help='initial global-context share when weighting the candidate union')
     parser.add_argument('--dual_use_global', type=int, choices=[0, 1], default=1)
-    parser.add_argument('--dual_use_future', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_use_future', type=int, choices=[0, 1], default=0,
+                        help='optional direct-future expert; disabled in the robust residual default')
     parser.add_argument('--dual_use_residual', type=int, choices=[0, 1], default=1)
-    parser.add_argument('--dual_causal_gap', type=int, default=-1,
-                        help='extra gap after a memory target; -1 uses pred_len')
+    parser.add_argument('--dual_causal_gap', type=int, default=0,
+                        help='optional extra gap after a memory target; 0 is already causal')
     parser.add_argument('--dual_horizon_gate', type=int, choices=[0, 1], default=1)
     parser.add_argument('--dual_scale_residual', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--dual_train_metric', type=int, choices=[0, 1], default=0,
+                        help='learn full retrieval projections; disabled by default to reduce overfitting')
+    parser.add_argument('--dual_utility_loss_weight', type=float, default=0.1,
+                        help='oracle shrinkage supervision for the residual reliability gate')
     parser.add_argument('--dual_gamma_grid', type=str, default='0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1',
                         help='validation-only global correction strengths; must include values in [0,1]')
     # Context-conditioned low-rank output calibration
